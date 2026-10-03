@@ -1,4 +1,4 @@
-# HearYe 2.2
+# HearYe 2.2.1
 
 A free Mac app that saves the audio of public meetings for transcription — one
 link at a time, or by watching a newsroom's channels, Granicus archives and
