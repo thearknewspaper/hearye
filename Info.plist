@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>HearYe</string>
+	<key>CFBundleExecutable</key>
+	<string>HearYe</string>
+	<key>CFBundleIconFile</key>
+	<string>HearYe.icns</string>
+	<key>CFBundleIconName</key>
+	<string>HearYe</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.kevin.hearye</string>
+	<key>CFBundleName</key>
+	<string>HearYe</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.1.1</string>
+	<key>CFBundleVersion</key>
+	<string>26</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSUserNotificationAlertStyle</key>
+	<string>alert</string>
+</dict>
+</plist>
