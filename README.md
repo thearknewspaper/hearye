@@ -12,6 +12,8 @@ and free for any newsroom under the MIT License.
 [latest release](https://github.com/thearknewspaper/hearye/releases/latest).
 Apple Silicon, macOS 13 or later.
 
+![HearYe watching a Granicus feed and a school board's recordings page](docs/screenshot.jpg)
+
 ## Editions
 
 | | Free edition | The Ark edition |
