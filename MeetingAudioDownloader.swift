@@ -2452,7 +2452,11 @@ private struct ContentView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Public Media URL (YouTube, Granicus)")
                         .font(.headline)
-                    TextField("https://www.youtube.com/watch?v=… or a Granicus meeting URL", text: $model.urlText)
+                    // A verbatim prompt: as a string literal the URL became a Markdown link
+                    // and the rest of the hint rendered black, unreadable in dark mode.
+                    TextField(text: $model.urlText, prompt: Text(verbatim: "https://www.youtube.com/watch?v=… or a Granicus meeting URL")) {
+                        Text("Public media URL")
+                    }
                         .textFieldStyle(.roundedBorder)
                         .focused($urlFieldFocused)
                         .disabled(model.isDownloading)
