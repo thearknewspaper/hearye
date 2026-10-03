@@ -1,7 +1,44 @@
-# HearYe 2.1.1
+# HearYe 2.2
 
-A native macOS GUI for downloading public YouTube and Granicus media as audio
-for transcription.
+A free Mac app that saves the audio of public meetings for transcription — one
+link at a time, or by watching a newsroom's channels, Granicus archives and
+recordings pages and fetching each new meeting on its own.
+
+Built by Kevin Hessel for The Ark, the weekly newspaper serving Tiburon,
+Belvedere and Strawberry since 1973 ([thearknewspaper.com](https://www.thearknewspaper.com)),
+and free for any newsroom under the MIT License.
+
+**Download:** [kevinhessel.com/hearye](https://www.kevinhessel.com/hearye) ·
+[latest release](https://github.com/thearknewspaper/hearye/releases/latest).
+Apple Silicon, macOS 13 or later.
+
+## Editions
+
+| | Free edition | The Ark edition |
+|---|---|---|
+| Bundle ID | `com.kevinhessel.hearye` | `com.kevin.hearye` |
+| Ready-made sources | None — add your own | Tiburon, Belvedere, Reed Union, Marin BOS |
+| Watch list and LaunchAgent | `~/Library/Application Support/com.kevinhessel.hearye`, `com.kevinhessel.hearye.watcher` | `~/Library/Application Support/HearYe`, `com.kevin.hearye.watcher` |
+| Updates | Checks this repo's releases | In-house |
+
+The differences live in `Editions/<Edition>/` (`Sources.json`, `Edition.plist`);
+build with `EDITION=ark|public`. The two can run side by side.
+
+## What changed in 2.2
+
+- Choose the save folder (it was always `~/Downloads`), and optionally open
+  each new file in another app. Both the window and the watcher use them.
+- Watch any source a newsroom pastes: YouTube channels and playlists, Granicus
+  archives (`ViewPublisher.php?view_id=N`, resolved to the body's podcast
+  feed), any podcast-style RSS feed, or a page that links its recordings.
+  `HearYe --resolve <link>` prints what a link resolves to.
+- Download Engine: HearYe fetches the official yt-dlp release once a day when
+  it's newer than the bundled one, verifies it against the release's
+  SHA2-256SUMS, and keeps it in Application Support, where the launcher
+  prefers it. A HearYe update that bundles something newer clears it.
+- About window, offline Help guide, Report a Problem, What's New, and an
+  update check against GitHub releases (shared `NewsroomKit.swift`, the same
+  file Captioneer uses).
 
 Pasting, typing, or dropping a public URL into the link field automatically
 starts inspection about half a second after you stop editing; the Inspect link
@@ -161,16 +198,15 @@ button remains available for retries.
 Releases are for Apple Silicon Macs only; Intel builds are no longer made. The
 app bundles its own `yt-dlp`, Python runtime, deno, and FFmpeg, so the
 recipient does not need Homebrew, Python, or FFmpeg installed.
-HearYe always saves audio to the current user's `~/Downloads` folder and has no
-application-level duration limit. After inspection, the filename defaults to
+HearYe saves audio to `~/Downloads` unless a different folder is chosen in the
+window, and has no application-level duration limit. After inspection, the filename defaults to
 the media title with macOS-unsafe characters cleaned up. A manually edited name
 is kept for that link, and reset when you inspect a different one. If a file of
 that name already exists, HearYe appends ` (2)`, ` (3)`, and so on rather than
 overwriting or silently skipping the download.
 
-HearYe does not launch a transcription app after downloading. Point MacWhisper's
-Watch Folder at `~/Downloads` if you want MacWhisper to automatically pick up
-completed audio files.
+Point MacWhisper's Watch Folder at the save folder to pick up completed audio
+automatically, or use **Choose App…** to open each new file in an app.
 
 The minimum supported system is macOS 13.0.
 
@@ -183,10 +219,11 @@ second x86_64 Homebrew in `/usr/local`.
 
 ```sh
 brew install yt-dlp ffmpeg deno
-./build_release.sh arm64
+./build_release.sh arm64                  # the Ark edition
+EDITION=public ./build_release.sh arm64   # the free edition
 ```
 
-This creates `dist/HearYe-2.1-macOS-arm64.zip` and its SHA-256 file.
+This creates `dist/HearYe-2.2.0-macOS-arm64.zip` (or `HearYe-Public-…`) and its SHA-256 file.
 
 For a smooth first launch on another Mac, sign and notarize the app with an
 Apple Developer ID certificate. Store the notarization profile in the

@@ -6,9 +6,17 @@ TARGET_ARCH="${1:-universal}"
 case "$TARGET_ARCH" in
   arm64|x86_64|universal) ;;
   *)
-    echo "Usage: $0 [arm64|x86_64|universal]" >&2
+    echo "Usage: EDITION=ark|public $0 [arm64|x86_64|universal]" >&2
     exit 2
     ;;
+esac
+# Which newsroom setup to bundle. Ark keeps com.kevin.hearye, so installed
+# copies keep their watch list and LaunchAgent; Public is the free download.
+EDITION="${EDITION:-ark}"
+case "$EDITION" in
+  ark)    EDITION_DIR="$SCRIPT_DIR/Editions/Ark";    BUNDLE_ID="com.kevin.hearye" ;;
+  public) EDITION_DIR="$SCRIPT_DIR/Editions/Public"; BUNDLE_ID="com.kevinhessel.hearye" ;;
+  *) echo "EDITION must be ark or public" >&2; exit 2 ;;
 esac
 # Built outside the cloud-synced source tree: Dropbox rewrites files inside a
 # bundle and breaks its code seal, and a launchable copy left here is what
@@ -36,7 +44,9 @@ build_target() {
     -framework SwiftUI \
     -framework AppKit \
     -o "$BUILD_DIR/HearYe-$arch" \
-    "$SCRIPT_DIR/MeetingAudioDownloader.swift"
+    "$SCRIPT_DIR/MeetingAudioDownloader.swift" \
+    "$SCRIPT_DIR/NewsroomKit.swift" \
+    "$SCRIPT_DIR/EngineUpdater.swift"
 }
 
 case "$TARGET_ARCH" in
@@ -56,6 +66,17 @@ case "$TARGET_ARCH" in
 esac
 
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$CONTENTS_DIR/Info.plist"
+for key in NewsroomEdition NewsroomProjectURL NewsroomRepoURL NewsroomUpdateFeed NewsroomSupportEmail; do
+  val="$(/usr/libexec/PlistBuddy -c "Print :$key" "$EDITION_DIR/Edition.plist" 2>/dev/null || true)"
+  /usr/libexec/PlistBuddy -c "Delete :$key" "$CONTENTS_DIR/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :$key string $val" "$CONTENTS_DIR/Info.plist"
+done
+cp "$EDITION_DIR/Sources.json" "$RESOURCES_DIR/Sources.json"
+for f in Help.html WhatsNew.txt; do
+  [[ -f "$SCRIPT_DIR/Resources/$f" ]] && cp "$SCRIPT_DIR/Resources/$f" "$RESOURCES_DIR/$f"
+done
+cp "$SCRIPT_DIR/THIRD_PARTY_NOTICES.md" "$RESOURCES_DIR/THIRD_PARTY_NOTICES.txt"
 cp "$SCRIPT_DIR/HearYe.icns" "$RESOURCES_DIR/HearYe.icns"
 chmod +x "$MACOS_DIR/HearYe"
-echo "Built: $APP_DIR"
+echo "Built: $APP_DIR ($EDITION edition, $BUNDLE_ID)"

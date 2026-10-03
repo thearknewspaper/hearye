@@ -1,0 +1,4 @@
+• Choose where audio is saved (it was always ~/Downloads), and optionally open each new file in another app, such as a transcription app.
+• Watch more kinds of sources: paste a Granicus archive, any podcast-style feed, or a page that links its recordings — not just YouTube.
+• HearYe keeps its download engine (yt-dlp) current on its own, so YouTube changes stop breaking downloads. See HearYe ▸ Download Engine….
+• A full guide in the Help menu, Report a Problem…, and an About window with update checks.

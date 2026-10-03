@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HearYe Guide</title>
+<style>
+  :root { --ink:#1d1d1f; --muted:#6e6e73; --rule:#d2d2d7; --bg:#fff; --accent:#0a5cc2; --code:#f2f2f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#f5f5f7; --muted:#a1a1a6; --rule:#3a3a3c; --bg:#1c1c1e; --accent:#5aa2ff; --code:#2c2c2e; }
+  }
+  body { font: 15px/1.55 -apple-system, BlinkMacSystemFont, sans-serif; color: var(--ink); background: var(--bg);
+         max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  h2 { font-size: 20px; margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--rule); }
+  h3 { font-size: 16px; margin-top: 24px; }
+  .lede { color: var(--muted); margin-top: 0; }
+  nav { background: var(--code); border-radius: 10px; padding: 12px 18px; margin: 20px 0; }
+  nav a { margin-right: 14px; white-space: nowrap; }
+  a { color: var(--accent); }
+  code, kbd { background: var(--code); border-radius: 4px; padding: 1px 5px; font: 13px ui-monospace, Menlo, monospace; word-break: break-all; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 14px; }
+  td, th { border-bottom: 1px solid var(--rule); padding: 6px 8px; text-align: left; vertical-align: top; }
+  .tip { border-left: 3px solid var(--accent); padding: 4px 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>HearYe Guide</h1>
+<p class="lede">Public meetings, preserved. Press <kbd>⌘F</kbd> to search this page.</p>
+
+<nav>
+  <a href="#start">Getting started</a>
+  <a href="#download">Downloading one meeting</a>
+  <a href="#watch">Watching for new meetings</a>
+  <a href="#sources">What can be watched</a>
+  <a href="#output">Where audio goes</a>
+  <a href="#engine">Download engine</a>
+  <a href="#problems">Common problems</a>
+  <a href="#faq">FAQ</a>
+</nav>
+
+<h2 id="start">Getting started</h2>
+<p>HearYe saves the audio of public meetings — city councils, school boards, commissions — as <code>.m4a</code> files ready for a transcription app. It does two jobs:</p>
+<ol>
+  <li><b>Download one meeting</b> from a link you paste.</li>
+  <li><b>Watch</b> your beat's channels and archives, and fetch each new meeting on its own, even with the window closed.</li>
+</ol>
+<p>Everything it needs (yt-dlp, FFmpeg and a JavaScript runtime) is built in. There's nothing else to install.</p>
+
+<h2 id="download">Downloading one meeting</h2>
+<ol>
+  <li>Paste, type or drag a link into the box: a YouTube video, a Granicus meeting page, Vimeo, Zoom recording, or a direct audio/video file.</li>
+  <li>HearYe inspects it automatically and shows the title it found.</li>
+  <li>Optionally rename the file, pick a format, then click <b>Download audio</b> (or press Return).</li>
+</ol>
+<p>A long meeting takes a minute or two to convert after downloading. The file appears in your save folder only once it's finished, so a transcription app watching that folder never grabs half a file.</p>
+
+<h2 id="watch">Watching for new meetings</h2>
+<ol>
+  <li>In <b>Watch for new meetings</b>, paste a source (see the next section) and click <b>Add</b>.</li>
+  <li>Choose how often to check: every hour, 6 hours, 12 hours or day.</li>
+  <li>Turn on <b>Watch my selected channels</b>.</li>
+</ol>
+<p>From then on, HearYe checks in the background, even after you quit it and after a restart. When a meeting appears it downloads the audio and sends an alert that stays until you dismiss it. Click <b>Allow</b> the first time macOS asks about notifications.</p>
+<ul>
+  <li><b>Only new meetings:</b> recordings already posted when you start watching are left alone, not downloaded as a backlog.</li>
+  <li><b>Live streams</b> are fetched once the recording is finished.</li>
+  <li><b>Check now</b> checks immediately, whether watching is on or not.</li>
+</ul>
+
+<h2 id="sources">What can be watched</h2>
+<table>
+  <tr><th>Source</th><th>Paste something like</th></tr>
+  <tr><td>A YouTube channel</td><td><code>https://www.youtube.com/@CityName/videos</code> or <code>@CityName</code></td></tr>
+  <tr><td>One board on a shared channel</td><td>its playlist: <code>https://www.youtube.com/playlist?list=PL…</code></td></tr>
+  <tr><td>A Granicus archive</td><td><code>https://city.granicus.com/ViewPublisher.php?view_id=2</code>. HearYe finds the body's podcast feed.</td></tr>
+  <tr><td>Any podcast-style RSS feed</td><td>a feed URL whose items carry audio or video</td></tr>
+  <tr><td>A recordings page</td><td>a school board or district page that links its recordings (audio or video files, Zoom recordings, Vimeo). HearYe reads the page's main content and names each meeting after its link text.</td></tr>
+</table>
+<p class="tip">Not working for your city's system (Swagit, BoardDocs, Legistar, CivicPlus video)? Paste a single meeting link into the download box first. If that works, use <b>Help ▸ Report a Problem…</b> to ask for that system to be supported for watching.</p>
+
+<h2 id="output">Where audio goes</h2>
+<p>By default, <code>~/Downloads</code>. Click <b>Change…</b> beside "Saved to" to pick any folder; downloads and watched meetings both use it. Point a transcription app's watch folder (MacWhisper, for example) at the same place.</p>
+<p><b>Choose App…</b> opens each new file in an app of your choice as soon as it's saved.</p>
+<p>Files keep the source's audio quality and channels. A 69-minute meeting is about 125 MB.</p>
+
+<h2 id="engine">Download engine</h2>
+<p>YouTube changes its site often, and yt-dlp, the engine HearYe uses, changes to keep up. HearYe checks for a new yt-dlp once a day and installs it after verifying its published checksum. <b>HearYe ▸ Download Engine…</b> shows the version in use, lets you update now, or go back to the version that came with HearYe.</p>
+
+<h2 id="problems">Common problems</h2>
+<h3>"Sign in to confirm you're not a bot" or a YouTube download fails</h3>
+<p>Open <b>HearYe ▸ Download Engine…</b> and click <b>Update yt-dlp</b>, then try again. If it keeps failing, YouTube may be rate-limiting your network. Wait an hour.</p>
+<h3>No alert when a meeting arrives</h3>
+<p>Check <b>System Settings ▸ Notifications ▸ HearYe</b>. On a Mac managed by an IT department, notifications may be blocked; HearYe then shows a dialog with its icon instead.</p>
+<h3>Watching stopped after I moved or updated the app</h3>
+<p>Open HearYe once. It repairs the background job whenever the app's location changes.</p>
+<h3>A source was added but nothing downloads</h3>
+<p>Only meetings posted after you started watching are fetched. Use <b>Check now</b> after the next meeting goes up, or paste an older meeting into the download box.</p>
+<h3>Something else</h3>
+<p><b>Help ▸ Report a Problem…</b> gathers the version and recent log for you to review before anything is sent.</p>
+
+<h2 id="faq">FAQ</h2>
+<h3>Is downloading meetings allowed?</h3>
+<p>HearYe is meant for public meetings that governments post for the public. Use only media you're allowed to download, and follow each provider's terms.</p>
+<h3>Does HearYe send my data anywhere?</h3>
+<p>No. It talks only to the sites you point it at, to GitHub once a day to check for updates to HearYe and yt-dlp, and to nothing else.</p>
+<h3>Is it free?</h3>
+<p>Yes. HearYe was built for The Ark, the weekly newspaper serving Tiburon, Belvedere and Strawberry since 1973, and is free for any newsroom under the MIT License. It bundles yt-dlp, FFmpeg, Python and deno under their own licenses; see <b>About HearYe ▸ Acknowledgments</b>.</p>
+</body>
+</html>

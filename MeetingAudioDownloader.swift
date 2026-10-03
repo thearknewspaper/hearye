@@ -456,10 +456,7 @@ private final class DownloaderModel: ObservableObject {
         filename = "meeting-audio-\(Self.filenameDate())"
     }
 
-    var downloadsDirectory: URL {
-        FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
-    }
+    var downloadsDirectory: URL { MeetingWatcher.outputDirectory() }
 
     var canDownload: Bool {
         probe != nil && !isInspecting && !isDownloading
@@ -690,7 +687,7 @@ private final class DownloaderModel: ObservableObject {
         } catch {
             errorMessage = "Could not use \(directory.path): \(error.localizedDescription)"
             didFail = true
-            status = "The Downloads folder is not available."
+            status = "The save folder (\(MeetingWatcher.displayPath(directory))) is not available."
             return
         }
 
@@ -911,7 +908,8 @@ private final class DownloaderModel: ObservableObject {
             hasSavedCurrentLink = true
             errorMessage = nil
             didFail = false
-            status = "Saved \(written.lastPathComponent) to ~/Downloads."
+            status = "Saved \(written.lastPathComponent) to \(MeetingWatcher.displayPath(downloadsDirectory))."
+            MeetingWatcher.handOff(written)
             downloadLog.notice("Saved \(written.path, privacy: .public)")
         } else if exitCode == 0 && (skippedExistingFile || !exists) {
             // Exit 0 is not proof anything was written.
@@ -920,7 +918,7 @@ private final class DownloaderModel: ObservableObject {
             status = "Nothing was saved."
             errorMessage = skippedExistingFile
                 ? "yt-dlp skipped this because a file of that name already exists. Rename the file and try again."
-                : "yt-dlp reported success but no audio file was written to ~/Downloads."
+                : "yt-dlp reported success but no audio file was written to \(MeetingWatcher.displayPath(downloadsDirectory))."
             downloadLog.error("Exit 0 but no output at \(written.path, privacy: .public)")
         } else {
             progress = nil
@@ -1084,6 +1082,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Channel watcher
 
+/// The watcher's folders, for code in other files (MeetingWatcher is private).
+enum MeetingWatcherPaths {
+    static var stateDirectory: URL { MeetingWatcher.stateDirectory }
+}
+
 private struct WatchedChannel: Codable, Identifiable, Equatable {
     var id: String { channelId }
     /// The human landing page for this source — what the reporter opens.
@@ -1142,6 +1145,11 @@ private struct WatcherState: Codable {
     var watchingSince: [String: Date]?
     var lastCheck: Date?
     var lastResult: String?
+    /// Where audio is saved; nil = ~/Downloads. Shared by the window and the
+    /// watcher, which is why it lives in the watcher's state file.
+    var outputFolder: String?
+    /// An app to open each new file in (e.g. a transcription app); nil = none.
+    var openWithApp: String?
 }
 
 /// The headless half of channel watching. launchd re-runs the app's own
@@ -1162,8 +1170,43 @@ private enum MeetingWatcher {
         return FileManager.default.homeDirectoryForCurrentUser
     }
 
+    /// The Ark edition keeps its historical folder so existing watch lists
+    /// carry over; any other edition (the free one) gets its own, so the two
+    /// on one Mac never share a watch list or race each other's downloads.
+    static var stateFolderName: String {
+        let id = Bundle.main.bundleIdentifier ?? "com.kevin.hearye"
+        return id == "com.kevin.hearye" ? "HearYe" : id
+    }
+
     static var stateDirectory: URL {
-        homeDirectory.appendingPathComponent("Library/Application Support/HearYe")
+        homeDirectory.appendingPathComponent("Library/Application Support/\(stateFolderName)")
+    }
+
+    /// Where finished audio lands: the folder chosen in the window, else
+    /// ~/Downloads (which MacWhisper and similar apps can watch).
+    static func outputDirectory(for state: WatcherState? = nil) -> URL {
+        let chosen = (state ?? loadState()).outputFolder
+        if let chosen, !chosen.isEmpty {
+            return URL(fileURLWithPath: (chosen as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return homeDirectory.appendingPathComponent("Downloads", isDirectory: true)
+    }
+
+    /// "~/Downloads" style, for status lines.
+    static func displayPath(_ url: URL) -> String {
+        let home = homeDirectory.path
+        return url.path.hasPrefix(home) ? "~" + url.path.dropFirst(home.count) : url.path
+    }
+
+    /// Opens a finished file in the app chosen in the window (a transcription
+    /// app, say), if any.
+    static func handOff(_ file: URL, state: WatcherState? = nil) {
+        guard let app = (state ?? loadState()).openWithApp, !app.isEmpty,
+              FileManager.default.fileExists(atPath: app) else { return }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-g", "-a", app, file.path]
+        try? task.run()
     }
     static var stateURL: URL { stateDirectory.appendingPathComponent("watcher.json") }
 
@@ -1317,6 +1360,69 @@ private enum MeetingWatcher {
             .first.map { $0.split(separator: "\t", maxSplits: 1).map(String.init) } ?? []
         guard fields.count == 2, fields[0].hasPrefix("UC") else { return nil }
         return WatchedChannel(url: normalized, channelId: fields[0], title: fields[1])
+    }
+
+    /// Any watchable source: YouTube channels and playlists through yt-dlp;
+    /// Granicus archives through their per-body podcast feed; any RSS feed
+    /// with audio enclosures; and, last, a web page whose links point at
+    /// recordings.
+    static func resolveSource(_ input: String) async -> WatchedChannel? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        if trimmed.hasPrefix("@") || lower.contains("youtube.com/") || lower.contains("youtu.be/") {
+            return await Task.detached { resolveChannel(trimmed) }.value
+        }
+        guard let url = URL(string: trimmed), let host = url.host?.lowercased(),
+              url.scheme == "http" || url.scheme == "https" else { return nil }
+
+        // Granicus: ViewPublisher.php?view_id=N has a matching Podcast.php feed.
+        if host == "granicus.com" || host.hasSuffix(".granicus.com"),
+           let viewID = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+               .queryItems?.first(where: { $0.name == "view_id" })?.value {
+            let feed = "https://\(host)/Podcast.php?view_id=\(viewID)"
+            if let entries = await fetchPodcastEntries(feedURL: feed), !entries.isEmpty {
+                let title = await feedTitle(feed) ?? "\(host.split(separator: ".").first.map(String.init)?.capitalized ?? "Granicus") meetings"
+                return WatchedChannel(url: trimmed, channelId: "podcast:\(host):\(viewID)",
+                                      title: title, kind: "podcast", feedURL: feed)
+            }
+        }
+        // A feed pasted directly.
+        if let entries = await fetchPodcastEntries(feedURL: trimmed), !entries.isEmpty {
+            return WatchedChannel(url: trimmed, channelId: "podcast:\(trimmed)",
+                                  title: await feedTitle(trimmed) ?? host, kind: "podcast", feedURL: trimmed)
+        }
+        // A page that links its recordings.
+        if let entries = await fetchWebpageEntries(pageURL: trimmed), !entries.isEmpty {
+            return WatchedChannel(url: trimmed, channelId: "webpage:\(trimmed)",
+                                  title: await pageTitle(trimmed) ?? host, kind: "webpage")
+        }
+        return nil
+    }
+
+    /// The feed's own <channel><title>.
+    static func feedTitle(_ feed: String) async -> String? {
+        guard let url = URL(string: feed),
+              let (data, _) = try? await URLSession.shared.data(from: url),
+              let xml = String(data: data, encoding: .utf8),
+              let r = xml.range(of: #"<title>(?:<!\[CDATA\[)?([^<\]]+)"#, options: .regularExpression) else { return nil }
+        let raw = xml[r].replacingOccurrences(of: #"<title>(<!\[CDATA\[)?"#, with: "", options: .regularExpression)
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    /// The page's <title>, trimmed of a trailing " | Site name".
+    static func pageTitle(_ page: String) async -> String? {
+        guard let url = URL(string: page) else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue(downloaderUserAgent, forHTTPHeaderField: "User-Agent")
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let html = String(data: data, encoding: .utf8),
+              let r = html.range(of: #"<title[^>]*>[^<]+"#, options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let raw = html[r].replacingOccurrences(of: #"<title[^>]*>"#, with: "", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: "&amp;", with: "&")
+        let first = raw.components(separatedBy: " | ").first ?? raw
+        let t = first.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
     }
 
     /// The list id in a playlist link — /playlist?list=…, or a watch or
@@ -1608,7 +1714,7 @@ private enum MeetingWatcher {
 
     static func downloadAudio(mediaURL: String, title: String, channelTitle: String) -> Bool {
         guard let ffmpegPath = bundledExecutable(named: "ffmpeg") else { return false }
-        let downloads = homeDirectory.appendingPathComponent("Downloads")
+        let downloads = outputDirectory()
         try? FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
         let base = uniqueAudioBaseName(sanitizedBaseName(title), extension: "m4a", in: downloads)
         let outputURL = downloads.appendingPathComponent("\(base).m4a")
@@ -1675,6 +1781,7 @@ private enum MeetingWatcher {
             return false
         }
         watcherLog.notice("Watcher saved \(outputURL.lastPathComponent, privacy: .public) for \(channelTitle, privacy: .public)")
+        handOff(outputURL)
         return true
     }
 
@@ -1806,7 +1913,7 @@ private enum MeetingWatcher {
                     savedCount += 1
                     await alert(
                         title: "New \(channel.title) meeting saved",
-                        body: "\(entry.title) — audio is in your Downloads folder."
+                        body: "\(entry.title) — audio is in \(displayPath(outputDirectory()))."
                     )
                     continue
                 }
@@ -1846,7 +1953,8 @@ private enum MeetingWatcher {
 /// A LaunchAgent survives app quit, logout, and reboot — that is what makes
 /// this a watcher rather than a timer that dies with the window.
 private enum WatcherAgent {
-    static let label = "com.kevin.hearye.watcher"
+    /// Per edition: the Ark edition's is the historical com.kevin.hearye.watcher.
+    static var label: String { "\(Bundle.main.bundleIdentifier ?? "com.kevin.hearye").watcher" }
 
     static var plistURL: URL {
         MeetingWatcher.homeDirectory.appendingPathComponent("Library/LaunchAgents/\(label).plist")
@@ -1916,30 +2024,16 @@ private enum WatcherAgent {
 
 @MainActor
 private final class WatcherModel: ObservableObject {
-    /// The Ark's home-beat meeting sources ship as ready-made selectors —
-    /// identities pre-resolved, so ticking one needs no network lookup.
-    /// None is watched until a reporter ticks it.
-    static let presetChannels: [WatchedChannel] = [
-        WatchedChannel(
-            url: "https://www.youtube.com/@townoftiburon1964/videos",
-            channelId: "UCm1Qh2lMsMcvDt3QiXKrf6g",
-            title: "Town of Tiburon"),
-        WatchedChannel(
-            url: "https://www.youtube.com/@CityofBelvedere/videos",
-            channelId: "UCSSPUdGTgxXb_v6Im5q0lEA",
-            title: "City of Belvedere"),
-        WatchedChannel(
-            url: "https://www.reedschools.org/school-board/meeting-recordings",
-            channelId: "webpage:reedschools-board",
-            title: "Reed Union School District",
-            kind: "webpage"),
-        WatchedChannel(
-            url: "https://www.marincounty.gov/departments/board/board-supervisors-meetings",
-            channelId: "podcast:marin-bos",
-            title: "Marin County Board of Supervisors",
-            kind: "podcast",
-            feedURL: "https://marin.granicus.com/Podcast.php?view_id=33")
-    ]
+    /// The edition's ready-made sources — identities pre-resolved, so
+    /// ticking one needs no network lookup. None is watched until ticked.
+    static let presetChannels: [WatchedChannel] = {
+        // Each edition ships its own ready-made list in Sources.json (the
+        // Ark's home-beat bodies; none for the free edition).
+        guard let url = Bundle.main.url(forResource: "Sources", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let list = try? JSONDecoder().decode([WatchedChannel].self, from: data) else { return [] }
+        return list
+    }()
 
     @Published private(set) var state: WatcherState
     @Published var newChannelText = ""
@@ -2025,10 +2119,10 @@ private final class WatcherModel: ObservableObject {
         isResolving = true
         noticeText = nil
         Task {
-            let resolved = await Task.detached { MeetingWatcher.resolveChannel(input) }.value
+            let resolved = await MeetingWatcher.resolveSource(input)
             self.isResolving = false
             guard let resolved else {
-                self.notice("That doesn't look like a public YouTube channel or playlist. Paste a channel link like https://www.youtube.com/@townoftiburon1964/videos, or a playlist link like https://www.youtube.com/playlist?list=….", isError: true)
+                self.notice("HearYe couldn't find meetings there. It can watch a YouTube channel or playlist, a Granicus archive or podcast feed, any podcast-style RSS feed, or a web page that links recordings (audio, video, Zoom or Vimeo links). See Help ▸ HearYe Guide for examples.", isError: true)
                 return
             }
             guard !self.state.channels.contains(where: { $0.channelId == resolved.channelId }) else {
@@ -2139,6 +2233,8 @@ private final class WatcherModel: ObservableObject {
         merged.enabled = state.enabled
         merged.intervalMinutes = state.intervalMinutes
         merged.channels = state.channels
+        merged.outputFolder = state.outputFolder
+        merged.openWithApp = state.openWithApp
         merged.seen = merged.seen.filter { key, _ in state.channels.contains { $0.channelId == key } }
         merged.watchingSince = merged.watchingSince?.filter { key, _ in state.channels.contains { $0.channelId == key } }
         MeetingWatcher.saveState(merged)
@@ -2149,17 +2245,76 @@ private final class WatcherModel: ObservableObject {
         noticeText = text
         noticeIsError = isError
     }
+
+    // MARK: Output settings (shared with the watcher through the state file)
+
+    var outputDirectory: URL { MeetingWatcher.outputDirectory(for: state) }
+
+    var openWithAppName: String? {
+        guard let path = state.openWithApp, !path.isEmpty else { return nil }
+        return FileManager.default.displayName(atPath: path).replacingOccurrences(of: ".app", with: "")
+    }
+
+    func chooseOutputFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = outputDirectory
+        panel.prompt = "Save Here"
+        panel.message = "Choose where HearYe saves meeting audio."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let downloads = MeetingWatcher.homeDirectory.appendingPathComponent("Downloads").standardizedFileURL
+        state.outputFolder = url.standardizedFileURL == downloads ? nil : url.path
+        persist()
+    }
+
+    func chooseOpenWithApp() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "Choose"
+        panel.message = "Choose an app to open each new recording in — a transcription app, for example."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.openWithApp = url.path
+        persist()
+    }
+
+    func clearOpenWithApp() {
+        state.openWithApp = nil
+        persist()
+    }
 }
 
 private struct WatcherSectionView: View {
     @ObservedObject var model: WatcherModel
+
+    static func icon(for kind: String) -> String {
+        switch kind {
+        case "playlist": return "list.and.film"
+        case "podcast": return "dot.radiowaves.up.forward"
+        case "webpage": return "doc.richtext"
+        default: return "dot.radiowaves.left.and.right"
+        }
+    }
+
+    static func kindLabel(for kind: String) -> String {
+        switch kind {
+        case "playlist": return "Playlist"
+        case "podcast": return "Feed"
+        case "webpage": return "Recordings page"
+        default: return "Channel"
+        }
+    }
 
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
                 Toggle("Watch my selected channels for new meetings", isOn: model.enabledBinding)
                     .font(.headline)
-                Text("Tick the channels for your beat, or add another below; nothing is watched until this is turned on.")
+                Text(WatcherModel.presetChannels.isEmpty
+                     ? "Add the meeting sources for your beat below; nothing is watched until this is turned on."
+                     : "Tick the channels for your beat, or add another below; nothing is watched until this is turned on.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -2187,9 +2342,9 @@ private struct WatcherSectionView: View {
 
                 ForEach(model.customChannels) { channel in
                     HStack {
-                        Image(systemName: channel.sourceKind == "playlist" ? "list.and.film" : "dot.radiowaves.left.and.right")
+                        Image(systemName: Self.icon(for: channel.sourceKind))
                             .foregroundStyle(model.state.enabled ? Color.green : Color.secondary)
-                            .accessibilityLabel(channel.sourceKind == "playlist" ? "Playlist" : "Channel")
+                            .accessibilityLabel(Self.kindLabel(for: channel.sourceKind))
                         if let landing = URL(string: channel.url) {
                             Link(channel.title, destination: landing)
                                 .font(.subheadline)
@@ -2203,7 +2358,7 @@ private struct WatcherSectionView: View {
                 }
 
                 HStack {
-                    TextField("Paste another YouTube channel or playlist link", text: $model.newChannelText)
+                    TextField("Paste a YouTube channel or playlist, Granicus archive, podcast feed or recordings page", text: $model.newChannelText)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { model.addChannel() }
                         .accessibilityLabel("Channel or playlist to watch")
@@ -2213,7 +2368,7 @@ private struct WatcherSectionView: View {
                     Button("Add") { model.addChannel() }
                         .disabled(model.isResolving || model.newChannelText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                Text("A channel's Videos page, like https://www.youtube.com/@ChannelName/videos — or a playlist, like https://www.youtube.com/playlist?list=…, to follow one board on a channel shared by many.")
+                Text("For example a channel's Videos page (https://www.youtube.com/@ChannelName/videos), a playlist for one board on a shared channel (https://www.youtube.com/playlist?list=…), a Granicus archive (https://city.granicus.com/ViewPublisher.php?view_id=2), or a school board's recordings page.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -2275,7 +2430,7 @@ private struct WatcherSectionView: View {
                         .foregroundStyle(model.noticeIsError ? Color.red : Color.secondary)
                 }
 
-                Text("New meetings are saved to ~/Downloads as m4a audio, with a notification that stays on screen until you dismiss it — click Allow when HearYe first asks to send notifications. Streams are fetched once the recording is finished; videos posted before you started watching are left alone.")
+                Text("New meetings are saved to your save folder as m4a audio, with a notification that stays on screen until you dismiss it — click Allow when HearYe first asks to send notifications. Streams are fetched once the recording is finished; videos posted before you started watching are left alone.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2367,13 +2522,32 @@ private struct ContentView: View {
                     }
                     HStack(spacing: 6) {
                         Image(systemName: "folder.fill")
-                        Text("Always saved to ~/Downloads")
+                        Text("Saved to \(MeetingWatcher.displayPath(watcherModel.outputDirectory))")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button("Change…") { watcherModel.chooseOutputFolder() }
+                            .controlSize(.small)
+                            .help("Where HearYe saves audio, for downloads here and for watched meetings")
                         Spacer()
-                        Button(model.lastOutputURL == nil ? "Open Downloads" : "Reveal in Finder") {
+                        Button(model.lastOutputURL == nil ? "Open Folder" : "Reveal in Finder") {
                             model.openDownloads()
                         }
+                    }
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.up.forward.app")
+                        if let app = watcherModel.openWithAppName {
+                            Text("Then open each new file in \(app)")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                            Button("Change…") { watcherModel.chooseOpenWithApp() }.controlSize(.small)
+                            Button("Don't Open") { watcherModel.clearOpenWithApp() }.controlSize(.small)
+                        } else {
+                            Text("Optionally open each new file in another app, such as a transcription app")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                            Button("Choose App…") { watcherModel.chooseOpenWithApp() }.controlSize(.small)
+                        }
+                        Spacer()
                     }
                 }
                 .padding(4)
@@ -2491,7 +2665,7 @@ private enum HearYeMain {
             return
         }
         // The watcher hands alerts to a LaunchServices-launched instance of the
-        // app (`open -n -b com.kevin.hearye --args --alert <title> <body>`), the
+        // app (`open -n -b <bundle id> --args --alert <title> <body>`), the
         // only context Notification Center accepts posts from. Post and exit.
         if let index = CommandLine.arguments.firstIndex(of: "--alert"),
            CommandLine.arguments.count > index + 2 {
@@ -2547,6 +2721,17 @@ private enum HearYeMain {
             }
             return
         }
+        // Support diagnostic: what a pasted source resolves to, as the
+        // watcher would see it (`HearYe --resolve <link>`).
+        if let index = CommandLine.arguments.firstIndex(of: "--resolve"),
+           CommandLine.arguments.count > index + 1 {
+            if let source = await MeetingWatcher.resolveSource(CommandLine.arguments[index + 1]) {
+                print("\(source.sourceKind)\t\(source.title)\t\(source.channelId)\t\(source.feedURL ?? "")")
+            } else {
+                print("not watchable")
+            }
+            return
+        }
         // Support diagnostic: what macOS thinks of this app's notifications.
         if CommandLine.arguments.contains("--notification-status") {
             let center = UNUserNotificationCenter.current()
@@ -2566,15 +2751,52 @@ private enum HearYeMain {
 
 private struct HearYeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @State private var showWhatsNew = false
 
     var body: some Scene {
         // A single window: with WindowGroup, Cmd-N opened rival windows that raced for
         // the same output filename.
         Window("HearYe", id: "main") {
             ContentView()
+                .onAppear {
+                    UpdateChecker.shared.checkInBackgroundIfDue()
+                    EngineUpdater.shared.updateInBackgroundIfDue()
+                    if WhatsNew.shouldShow() { showWhatsNew = true }
+                }
+                .sheet(isPresented: $showWhatsNew) { WhatsNewView() }
         }
         // Resizable down to the content's minimum, so it fits above the Dock
         // on a smaller display and scrolls; 2.0 locked the size to the content.
         .windowResizability(.contentMinSize)
+        .commands {
+            NewsroomCommands(appHelp: nil)
+            CommandGroup(after: .appSettings) {
+                EngineMenuButton()
+            }
+        }
+
+        Window("About HearYe", id: "about") {
+            AboutView(notices: AppIdentity.resource("THIRD_PARTY_NOTICES", "txt"),
+                      pitch: "Public meetings, preserved: audio from YouTube, Granicus and recordings pages, saved for transcription — and watched for you.")
+        }
+        .windowResizability(.contentSize)
+
+        Window("Report a Problem", id: "report") {
+            ProblemReportView(subsystem: "com.kevin.hearye")
+        }
+        .windowResizability(.contentSize)
+
+        Window("Download Engine", id: "engine") {
+            EngineUpdateView()
+        }
+        .windowResizability(.contentSize)
+    }
+}
+
+/// HearYe ▸ Download Engine…, beside Settings.
+private struct EngineMenuButton: View {
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Button("Download Engine…") { openWindow(id: "engine") }
     }
 }

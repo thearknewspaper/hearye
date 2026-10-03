@@ -13,8 +13,10 @@ DIST_DIR="$SCRIPT_DIR/dist"
 PLIST="$SCRIPT_DIR/Info.plist"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
 TARGET_ARCH="${1:-universal}"
-ARCHIVE="$DIST_DIR/HearYe-$VERSION-macOS-$TARGET_ARCH.zip"
-CHECKSUMS="$DIST_DIR/HearYe-$VERSION-macOS-$TARGET_ARCH.sha256"
+EDITION="${EDITION:-ark}"; export EDITION
+TAG=""; [[ "$EDITION" == "public" ]] && TAG="-Public"
+ARCHIVE="$DIST_DIR/HearYe$TAG-$VERSION-macOS-$TARGET_ARCH.zip"
+CHECKSUMS="$DIST_DIR/HearYe$TAG-$VERSION-macOS-$TARGET_ARCH.sha256"
 
 mkdir -p "$DIST_DIR"
 "$SCRIPT_DIR/build_app.sh" "$TARGET_ARCH"
