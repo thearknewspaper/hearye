@@ -266,9 +266,10 @@ opening it. Do not run the app from Dropbox, iCloud Drive, OneDrive, or another
 continuously synced folder: those services can rewrite signed nested files and
 cause macOS to reject the bundled Python runtime.
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before publishing a
-public release. The bundled FFmpeg build includes GPL-enabled components, so
-the applicable license and source-code obligations should be reviewed before
-distribution.
+Every public release must carry the source for the bundled GPL/LGPL
+libraries (FFmpeg, x264, x265, LAME, mpg123). After building, run
+`./collect_third_party_sources.sh <version>` and attach the archive it makes to
+the GitHub release, beside the app zip. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Use only media you are authorized to download and transcribe, and respect the source site's terms.
