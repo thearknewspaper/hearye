@@ -1901,7 +1901,7 @@ private enum MeetingWatcher {
                 fetched = await fetchPodcastEntries(feedURL: channel.feedURL ?? channel.url)
             case "webpage":
                 fetched = await fetchWebpageEntries(pageURL: channel.url)
-            case "swagit", "primegov", "civicclerk", "legistar":
+            case "swagit", "primegov", "civicclerk", "legistar", "boarddocs", "proudcity":
                 fetched = await fetchPlatformEntries(channel)
             case "playlist":
                 fetched = fetchPlaylistEntries(url: channel.url)
@@ -2352,7 +2352,7 @@ private struct WatcherSectionView: View {
         case "playlist": return "list.and.film"
         case "podcast": return "dot.radiowaves.up.forward"
         case "webpage": return "doc.richtext"
-        case "swagit", "primegov", "civicclerk", "legistar": return "building.columns"
+        case "swagit", "primegov", "civicclerk", "legistar", "boarddocs", "proudcity": return "building.columns"
         default: return "dot.radiowaves.left.and.right"
         }
     }
@@ -2365,6 +2365,8 @@ private struct WatcherSectionView: View {
         case "swagit": return "Swagit archive"
         case "primegov": return "PrimeGov portal"
         case "civicclerk": return "CivicClerk portal"
+        case "boarddocs": return "BoardDocs"
+        case "proudcity": return "ProudCity site"
         case "legistar": return "Legistar calendar"
         default: return "Channel"
         }
@@ -2800,7 +2802,7 @@ private enum HearYeMain {
                     switch source.sourceKind {
                     case "podcast": entries = await MeetingWatcher.fetchPodcastEntries(feedURL: source.feedURL ?? source.url)
                     case "webpage": entries = await MeetingWatcher.fetchWebpageEntries(pageURL: source.url)
-                    case "swagit", "primegov", "civicclerk", "legistar": entries = await MeetingWatcher.fetchPlatformEntries(source)
+                    case "swagit", "primegov", "civicclerk", "legistar", "boarddocs", "proudcity": entries = await MeetingWatcher.fetchPlatformEntries(source)
                     default: entries = nil
                     }
                     for e in (entries ?? []).prefix(3) {
@@ -2954,13 +2956,33 @@ extension MeetingWatcher {
         } else if host.hasSuffix(".portal.civicclerk.com") {
             candidate = WatchedChannel(url: "https://\(host)/", channelId: "civicclerk:\(first)",
                                        title: "\(siteName(host)) meetings", kind: "civicclerk", feedURL: first)
+        } else if host == "go.boarddocs.com" || host.hasSuffix(".boarddocs.com") {
+            // go.boarddocs.com/<state>/<org>/Board.nsf/...
+            let parts = url.path.split(separator: "/").map(String.init)
+            guard parts.count >= 2 else { return nil }
+            let site = "\(parts[0])/\(parts[1])"
+            candidate = WatchedChannel(url: "https://go.boarddocs.com/\(site)/Board.nsf/Public", channelId: "boarddocs:\(site)",
+                                       title: "\(parts[1].uppercased()) board meetings", kind: "boarddocs", feedURL: site)
         } else if host.hasSuffix(".legistar.com") {
             candidate = WatchedChannel(url: "https://\(host)/Calendar.aspx", channelId: "legistar:\(first)",
                                        title: "\(siteName(host)) meetings", kind: "legistar", feedURL: first)
         }
+        // ProudCity (WordPress for cities): no telltale host, so look for its
+        // scripts on the page, then confirm the "meeting" post type exists.
+        var probe: String?
+        if candidate == nil { probe = await fetchText(input); if probe == nil { probe = await fetchText("https://\(host)/") } }
+        if candidate == nil, let html = probe, html.contains("proud-actions-app") || html.contains("ProudCity"),
+           let list = await fetchText("https://\(host)/wp-json/wp/v2/meetings?per_page=1&_fields=type"), list.contains("\"meeting\"") {
+            let site = (await pageTitle("https://\(host)/") ?? "").components(separatedBy: CharacterSet(charactersIn: "|–-")).last?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            candidate = WatchedChannel(url: "https://\(host)/meetings/", channelId: "proudcity:\(host)",
+                                       title: site.isEmpty ? "\(siteName(host)) meetings" : "\(site) meetings", kind: "proudcity", feedURL: host)
+        }
         guard let channel = candidate else { return nil }
         guard let entries = await fetchPlatformEntries(channel), !entries.isEmpty else {
-            lastResolveHint = "HearYe recognized \(host) but found no recordings there yet."
+            lastResolveHint = channel.sourceKind == "boarddocs"
+                ? "This BoardDocs site doesn't attach video to its meetings. Look on the district's website for where it posts recordings (often YouTube) and add that instead."
+                : "HearYe recognized \(host) but found no recordings there yet."
             return nil
         }
         return channel
@@ -2972,6 +2994,8 @@ extension MeetingWatcher {
         case "primegov": return await primeGovEntries(host: channel.feedURL ?? "")
         case "civicclerk": return await civicClerkEntries(tenant: channel.feedURL ?? "")
         case "legistar": return await legistarEntries(client: channel.feedURL ?? "")
+        case "boarddocs": return await boardDocsEntries(site: channel.feedURL ?? "")
+        case "proudcity": return await proudCityEntries(host: channel.feedURL ?? "")
         default: return nil
         }
     }
@@ -3054,6 +3078,77 @@ extension MeetingWatcher {
             return WatcherEntry(id: "civicclerk:\(tenant):\(e["id"] ?? "")", title: "\(name), \(date)", mediaURL: media)
         }
         return entries.isEmpty ? nil : entries
+    }
+
+    /// BoardDocs lists every meeting in a JSON feed meant for search engines.
+    /// Each meeting's page (a form POST) carries a "Swagit Video" button
+    /// (data-client, data-ref) when the district records through Swagit, or
+    /// plain links to YouTube, Vimeo or Granicus. Only the newest dozen
+    /// meetings are opened, one request each. Tested on Prince George County
+    /// Public Schools, Va.
+    static func boardDocsEntries(site: String) async -> [WatcherEntry]? {
+        guard !site.isEmpty else { return nil }
+        let base = "https://go.boarddocs.com/\(site)/Board.nsf"
+        guard let text = await fetchText("\(base)/BD-GETMeetingsListForSEO?open"),
+              let list = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]] else { return nil }
+        let recent = list
+            .filter { ($0["Date"] as? String ?? "") <= ISO8601DateFormatter().string(from: Date()) }
+            .sorted { ($0["Date"] as? String ?? "") > ($1["Date"] as? String ?? "") }
+            .prefix(12)
+        var entries: [WatcherEntry] = []
+        for m in recent {
+            guard let id = m["Unique"] as? String, let html = await postForm("\(base)/BD-GetMeeting?open",
+                                                                             body: "id=\(id)&current_committee_id=x") else { continue }
+            var media: String?
+            if let client = matches(#"btn-meeting-video"[^>]*data-client="([^"]+)""#, in: html).first,
+               let ref = matches(#"btn-meeting-video"[^>]*data-ref="(\d+)""#, in: html).first {
+                media = "https://\(client).swagit.com/videos/\(ref)"
+            } else {
+                media = matches(#"(https?://[^"'\s<]*(?:youtube\.com/watch\?v=|youtu\.be/|vimeo\.com/\d|granicus\.com/MediaPlayer|swagit\.com/videos/)[^"'\s<]*)"#, in: html).first?
+                    .replacingOccurrences(of: "&amp;", with: "&")
+            }
+            guard let media else { continue }
+            let name = (m["Name"] as? String ?? "Meeting").trimmingCharacters(in: .whitespaces)
+            entries.append(WatcherEntry(id: "boarddocs:\(site):\(id)", title: name, mediaURL: media))
+        }
+        return entries.isEmpty ? nil : entries
+    }
+
+    /// ProudCity sites publish each meeting as a WordPress "meeting" post;
+    /// once the recording is up (usually on YouTube), it's embedded in that
+    /// post's page. The API's newest posts are mostly upcoming meetings, so
+    /// this reads the newest 24 and opens each page. Tested on Belvedere, Calif.
+    static func proudCityEntries(host: String) async -> [WatcherEntry]? {
+        guard !host.isEmpty,
+              let text = await fetchText("https://\(host)/wp-json/wp/v2/meetings?per_page=24&_fields=id,link,title"),
+              let list = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]] else { return nil }
+        var entries: [WatcherEntry] = []
+        for m in list {
+            guard let link = m["link"] as? String, let html = await fetchText(link) else { continue }
+            var media: String?
+            if let yt = matches(#"(?:youtube(?:-nocookie)?\.com/(?:embed/|watch\?v=|live/)|youtu\.be/)([A-Za-z0-9_-]{11})"#, in: html).first {
+                media = "https://www.youtube.com/watch?v=\(yt)"
+            } else if let vimeo = matches(#"vimeo\.com/(?:video/)?(\d{6,})"#, in: html).first {
+                media = "https://vimeo.com/\(vimeo)"
+            }
+            guard let media else { continue }
+            let title = ((m["title"] as? [String: Any])?["rendered"] as? String ?? "Meeting")
+                .replacingOccurrences(of: "&#8211;", with: "–").replacingOccurrences(of: "&amp;", with: "&")
+            entries.append(WatcherEntry(id: "proudcity:\(host):\(m["id"] ?? link)", title: title, mediaURL: media))
+        }
+        return entries.isEmpty ? nil : entries
+    }
+
+    static func postForm(_ address: String, body: String) async -> String? {
+        guard let url = URL(string: address) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.httpMethod = "POST"
+        request.setValue(downloaderUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(body.utf8)
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
 
     /// Legistar's public Web API. EventMedia is a Granicus clip number on most

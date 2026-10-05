@@ -1,3 +1,8 @@
+• Watch the meeting systems cities and school districts actually use: Swagit, Legistar, PrimeGov, CivicClerk, BoardDocs, ProudCity city sites and Cablecast pages, alongside Granicus and YouTube. Paste the system's public page and HearYe finds the recordings.
+• Granicus and Swagit player pages now download directly.
+• When a page can't be watched, HearYe says why and what to paste instead.
+
+From 2.2.1:
 • The link box hint is readable in dark mode again.
 
 From 2.2:

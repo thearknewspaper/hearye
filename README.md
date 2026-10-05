@@ -32,7 +32,8 @@ build with `EDITION=ark|public`. The two can run side by side.
   each new file in another app. Both the window and the watcher use them.
 - Watch any source a newsroom pastes: YouTube channels and playlists, Granicus
   archives (`ViewPublisher.php?view_id=N`, resolved to the body's podcast
-  feed), any podcast-style RSS feed, or a page that links its recordings.
+  feed), Swagit, Legistar, PrimeGov, CivicClerk, BoardDocs and ProudCity
+  sites, any podcast-style RSS feed, or a page that links its recordings.
   `HearYe --resolve <link>` prints what a link resolves to.
 - Download Engine: HearYe fetches the official yt-dlp release once a day when
   it's newer than the bundled one, verifies it against the release's
