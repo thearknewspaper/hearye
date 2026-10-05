@@ -216,6 +216,23 @@ private struct SourceResolver {
             }
         }
 
+        // A Swagit meeting page embeds its stream; find it off the main actor.
+        if host.hasSuffix(".swagit.com"), path.range(of: #"/videos/\d+$"#, options: .regularExpression) != nil {
+            let target = input.absoluteString
+            let stream = await Task.detached { MeetingWatcher.resolvePlayable(target) }.value
+            if stream != target, let streamURL = URL(string: stream) {
+                return ProbeResult(
+                    inputURL: input,
+                    downloadURL: streamURL,
+                    refererURL: input,
+                    title: "Swagit meeting",
+                    kind: "Swagit",
+                    detail: "Found the meeting's video stream on its Swagit page.",
+                    confidence: .likely
+                )
+            }
+        }
+
         if host == "youtube.com" || host.hasSuffix(".youtube.com") || host == "youtu.be" {
             return ProbeResult(
                 inputURL: input,
@@ -1366,7 +1383,12 @@ private enum MeetingWatcher {
     /// Granicus archives through their per-body podcast feed; any RSS feed
     /// with audio enclosures; and, last, a web page whose links point at
     /// recordings.
+    /// Why the last resolveSource returned nil, when there is something more
+    /// useful to say than "not found".
+    static var lastResolveHint: String?
+
     static func resolveSource(_ input: String) async -> WatchedChannel? {
+        lastResolveHint = nil
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = trimmed.lowercased()
         if trimmed.hasPrefix("@") || lower.contains("youtube.com/") || lower.contains("youtu.be/") {
@@ -1385,6 +1407,18 @@ private enum MeetingWatcher {
                 return WatchedChannel(url: trimmed, channelId: "podcast:\(host):\(viewID)",
                                       title: title, kind: "podcast", feedURL: feed)
             }
+            // Some Granicus pages are an index of other archives (San Diego's
+            // view 31 lists one per committee) with an empty feed of their own.
+            if let html = await fetchText(trimmed) {
+                let views = Set(matches(#"ViewPublisher\.php\?view_id=(\d+)"#, in: html)).subtracting([viewID])
+                if views.count >= 2 {
+                    lastResolveHint = "That Granicus page is an index of \(views.count) separate archives, one per board or committee. Open it, click the body you cover, and paste that archive's address instead."
+                    return nil
+                }
+            }
+        }
+        if let platform = await resolvePlatform(url: url, host: host, input: trimmed) {
+            return platform
         }
         // A feed pasted directly.
         if let entries = await fetchPodcastEntries(feedURL: trimmed), !entries.isEmpty {
@@ -1514,7 +1548,7 @@ private enum MeetingWatcher {
 
         func isMediaFilename(_ name: String) -> Bool {
             let path = (name.split(separator: "?").first.map(String.init) ?? name).lowercased()
-            return [".mp3", ".m4a", ".mp4", ".m4v", ".mov", ".wav"].contains { path.hasSuffix($0) }
+            return [".mp3", ".m4a", ".mp4", ".m4v", ".mov", ".wav", ".m3u8"].contains { path.hasSuffix($0) }
         }
 
         // Finalsite names the file behind a resource-manager link only in
@@ -1564,6 +1598,24 @@ private enum MeetingWatcher {
             }
             if title.isEmpty { title = "Meeting recording \(filenameDatestamp())" }
             entries.append(WatcherEntry(id: href, title: title, mediaURL: href))
+        }
+        // Players like Cablecast put each recording's stream URL in page data
+        // rather than in a link; name the meeting from the file's path.
+        if entries.isEmpty,
+           let streamRegex = try? NSRegularExpression(pattern: #"https?://[^"'\s<>]+?\.m3u8"#) {
+            let full = NSRange(fullHTML.startIndex..., in: fullHTML)
+            for match in streamRegex.matches(in: fullHTML, range: full) {
+                guard let r = Range(match.range, in: fullHTML) else { continue }
+                let href = String(fullHTML[r])
+                // A live channel is not a recording.
+                guard !href.contains("/live"), seenHrefs.insert(href).inserted else { continue }
+                let parts = href.split(separator: "/").map(String.init)
+                let slug = parts.count >= 2 ? parts[parts.count - 2] : href
+                let title = slug.replacingOccurrences(of: #"^\d+-"#, with: "", options: .regularExpression)
+                    .replacingOccurrences(of: #"-v\d+$"#, with: "", options: .regularExpression)
+                    .replacingOccurrences(of: "-", with: " ")
+                entries.append(WatcherEntry(id: href, title: title.isEmpty ? "Meeting recording" : title, mediaURL: href))
+            }
         }
         return entries.isEmpty ? nil : entries
     }
@@ -1719,9 +1771,9 @@ private enum MeetingWatcher {
         let base = uniqueAudioBaseName(sanitizedBaseName(title), extension: "m4a", in: downloads)
         let outputURL = downloads.appendingPathComponent("\(base).m4a")
 
-        var targetURL = mediaURL
+        var targetURL = resolvePlayable(mediaURL)
         var extraArguments: [String] = []
-        if let adjusted = vimeoAdjustment(for: mediaURL) {
+        if let adjusted = vimeoAdjustment(for: targetURL) {
             targetURL = adjusted.url
             extraArguments = adjusted.extraArguments
         }
@@ -1849,6 +1901,8 @@ private enum MeetingWatcher {
                 fetched = await fetchPodcastEntries(feedURL: channel.feedURL ?? channel.url)
             case "webpage":
                 fetched = await fetchWebpageEntries(pageURL: channel.url)
+            case "swagit", "primegov", "civicclerk", "legistar":
+                fetched = await fetchPlatformEntries(channel)
             case "playlist":
                 fetched = fetchPlaylistEntries(url: channel.url)
             default:
@@ -2122,6 +2176,10 @@ private final class WatcherModel: ObservableObject {
             let resolved = await MeetingWatcher.resolveSource(input)
             self.isResolving = false
             guard let resolved else {
+                if let hint = MeetingWatcher.lastResolveHint {
+                    self.notice(hint, isError: true)
+                    return
+                }
                 self.notice("HearYe couldn't find meetings there. It can watch a YouTube channel or playlist, a Granicus archive or podcast feed, any podcast-style RSS feed, or a web page that links recordings (audio, video, Zoom or Vimeo links). See Help ▸ HearYe Guide for examples.", isError: true)
                 return
             }
@@ -2294,6 +2352,7 @@ private struct WatcherSectionView: View {
         case "playlist": return "list.and.film"
         case "podcast": return "dot.radiowaves.up.forward"
         case "webpage": return "doc.richtext"
+        case "swagit", "primegov", "civicclerk", "legistar": return "building.columns"
         default: return "dot.radiowaves.left.and.right"
         }
     }
@@ -2303,6 +2362,10 @@ private struct WatcherSectionView: View {
         case "playlist": return "Playlist"
         case "podcast": return "Feed"
         case "webpage": return "Recordings page"
+        case "swagit": return "Swagit archive"
+        case "primegov": return "PrimeGov portal"
+        case "civicclerk": return "CivicClerk portal"
+        case "legistar": return "Legistar calendar"
         default: return "Channel"
         }
     }
@@ -2731,8 +2794,24 @@ private enum HearYeMain {
            CommandLine.arguments.count > index + 1 {
             if let source = await MeetingWatcher.resolveSource(CommandLine.arguments[index + 1]) {
                 print("\(source.sourceKind)\t\(source.title)\t\(source.channelId)\t\(source.feedURL ?? "")")
+                // With --entries, also list what the watcher would see.
+                if CommandLine.arguments.contains("--entries") {
+                    var entries: [WatcherEntry]?
+                    switch source.sourceKind {
+                    case "podcast": entries = await MeetingWatcher.fetchPodcastEntries(feedURL: source.feedURL ?? source.url)
+                    case "webpage": entries = await MeetingWatcher.fetchWebpageEntries(pageURL: source.url)
+                    case "swagit", "primegov", "civicclerk", "legistar": entries = await MeetingWatcher.fetchPlatformEntries(source)
+                    default: entries = nil
+                    }
+                    for e in (entries ?? []).prefix(3) {
+                        print("  \(e.title)\t\(e.mediaURL ?? e.id)")
+                        if CommandLine.arguments.contains("--playable"), let m = e.mediaURL {
+                            print("    -> \(MeetingWatcher.resolvePlayable(m))")
+                        }
+                    }
+                }
             } else {
-                print("not watchable")
+                print(MeetingWatcher.lastResolveHint ?? "not watchable")
             }
             return
         }
@@ -2802,5 +2881,238 @@ private struct EngineMenuButton: View {
     @Environment(\.openWindow) private var openWindow
     var body: some View {
         Button("Download Engine…") { openWindow(id: "engine") }
+    }
+}
+
+// MARK: - Meeting platforms
+
+/// Hosted meeting systems many small governments use. Each lists its
+/// recordings in its own way — an archive page (Swagit), a public JSON API
+/// (PrimeGov, CivicClerk, Legistar) — and some hand back a player page rather
+/// than a media file (Granicus, Swagit), which resolvePlayable turns into the
+/// stream yt-dlp can fetch. Tested against Houston, Bryan and Cedar Rapids
+/// (Swagit), Oklahoma City and Los Angeles (PrimeGov), Portland, Maine
+/// (CivicClerk), St. Paul, Fresno and Seattle (Legistar).
+extension MeetingWatcher {
+
+    static func fetchText(_ address: String, timeout: TimeInterval = 30) async -> String? {
+        guard let url = URL(string: address) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.setValue(downloaderUserAgent, forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+    }
+
+    static func fetchJSON(_ address: String) async -> Any? {
+        guard let url = URL(string: address) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return try? JSONSerialization.jsonObject(with: data)
+    }
+
+    /// First capture group of every match.
+    static func matches(_ pattern: String, in text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+        return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+            $0.numberOfRanges > 1 ? Range($0.range(at: 1), in: text).map { String(text[$0]) } : nil
+        }
+    }
+
+    /// "okc.primegov.com" -> "Okc"; good enough for a default name.
+    private static func siteName(_ host: String) -> String {
+        let first = host.split(separator: ".").first.map(String.init) ?? host
+        return first.prefix(1).uppercased() + first.dropFirst()
+    }
+
+    /// Watches a platform from whatever page of it the user pasted.
+    static func resolvePlatform(url: URL, host: String, input: String) async -> WatchedChannel? {
+        let first = host.split(separator: ".").first.map(String.init) ?? host
+        var candidate: WatchedChannel?
+        if host.hasSuffix(".swagit.com") {
+            // Swagit's <title> is often just "SwagitAdmin"; the page heading
+            // carries the place ("Houston, TX Video Archive").
+            var title = await pageTitle(input) ?? ""
+            if title.isEmpty || title.lowercased().contains("swagit"),
+               let html = await fetchText(input),
+               // The page also links other cities' archives; take the place
+               // whose letters match the site's subdomain (houstontx).
+               let place = matches(#"([A-Z][A-Za-z .'-]+, [A-Z]{2}) Video Archive"#, in: html).first(where: { p in
+                   let letters = p.lowercased().replacingOccurrences(of: "city of ", with: "").filter(\.isLetter)
+                   return letters == first
+               }) {
+                title = "\(place) meetings"
+            }
+            candidate = WatchedChannel(url: input, channelId: "swagit:\(input)",
+                                       title: title.isEmpty || title.lowercased().contains("swagit") ? "\(siteName(host)) meetings" : title,
+                                       kind: "swagit")
+        } else if host.hasSuffix(".primegov.com") {
+            candidate = WatchedChannel(url: "https://\(host)/public/portal", channelId: "primegov:\(host)",
+                                       title: "\(siteName(host)) meetings", kind: "primegov", feedURL: host)
+        } else if host.hasSuffix(".portal.civicclerk.com") {
+            candidate = WatchedChannel(url: "https://\(host)/", channelId: "civicclerk:\(first)",
+                                       title: "\(siteName(host)) meetings", kind: "civicclerk", feedURL: first)
+        } else if host.hasSuffix(".legistar.com") {
+            candidate = WatchedChannel(url: "https://\(host)/Calendar.aspx", channelId: "legistar:\(first)",
+                                       title: "\(siteName(host)) meetings", kind: "legistar", feedURL: first)
+        }
+        guard let channel = candidate else { return nil }
+        guard let entries = await fetchPlatformEntries(channel), !entries.isEmpty else {
+            lastResolveHint = "HearYe recognized \(host) but found no recordings there yet."
+            return nil
+        }
+        return channel
+    }
+
+    static func fetchPlatformEntries(_ channel: WatchedChannel) async -> [WatcherEntry]? {
+        switch channel.sourceKind {
+        case "swagit": return await swagitEntries(page: channel.url)
+        case "primegov": return await primeGovEntries(host: channel.feedURL ?? "")
+        case "civicclerk": return await civicClerkEntries(tenant: channel.feedURL ?? "")
+        case "legistar": return await legistarEntries(client: channel.feedURL ?? "")
+        default: return nil
+        }
+    }
+
+    /// Swagit archive pages link each meeting as /videos/<id>; the link text
+    /// is the meeting's name and date.
+    static func swagitEntries(page: String) async -> [WatcherEntry]? {
+        guard let base = URL(string: page), let html = await fetchText(page),
+              let regex = try? NSRegularExpression(pattern: #"<a\b[^>]*href="([^"]*/videos/(\d+))"[^>]*>(.*?)</a>"#,
+                                                   options: [.dotMatchesLineSeparators, .caseInsensitive]) else { return nil }
+        var seen = Set<String>(), entries: [WatcherEntry] = []
+        for m in regex.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+            guard let hrefR = Range(m.range(at: 1), in: html), let labelR = Range(m.range(at: 3), in: html),
+                  let href = URL(string: String(html[hrefR]), relativeTo: base)?.absoluteString else { continue }
+            let label = String(html[labelR])
+                .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if seen.contains(href) {
+                // The same video is often linked twice (thumbnail, then name);
+                // keep the version that carries a name.
+                if !label.isEmpty, let i = entries.firstIndex(where: { $0.id == href }), entries[i].title.hasPrefix("Meeting video") {
+                    entries[i] = WatcherEntry(id: href, title: label, mediaURL: href)
+                }
+                continue
+            }
+            seen.insert(href)
+            entries.append(WatcherEntry(id: href, title: label.isEmpty ? "Meeting video \(href.split(separator: "/").last ?? "")" : label, mediaURL: href))
+        }
+        return entries.isEmpty ? nil : entries
+    }
+
+    /// PrimeGov's public portal API: archived meetings for this year and last,
+    /// newest first, keeping the ones with a video link.
+    static func primeGovEntries(host: String) async -> [WatcherEntry]? {
+        guard !host.isEmpty else { return nil }
+        let year = Calendar.current.component(.year, from: Date())
+        var meetings: [[String: Any]] = []
+        for y in [year, year - 1] {
+            if let list = await fetchJSON("https://\(host)/api/v2/PublicPortal/ListArchivedMeetings?year=\(y)") as? [[String: Any]] {
+                meetings += list
+            }
+        }
+        let entries = meetings
+            .filter { ($0["videoUrl"] as? String)?.hasPrefix("http") == true }
+            .sorted { ($0["dateTime"] as? String ?? "") > ($1["dateTime"] as? String ?? "") }
+            .prefix(40)
+            .map { m -> WatcherEntry in
+                let title = [(m["title"] as? String)?.trimmingCharacters(in: .whitespaces), m["date"] as? String]
+                    .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: ", ")
+                return WatcherEntry(id: "primegov:\(host):\(m["id"] ?? "")", title: title, mediaURL: m["videoUrl"] as? String)
+            }
+        return entries.isEmpty ? nil : Array(entries)
+    }
+
+    /// CivicClerk's public API. Meetings carry a media address (full, or a
+    /// path in CivicPlus's storage) or a YouTube ID.
+    static func civicClerkEntries(tenant: String) async -> [WatcherEntry]? {
+        guard !tenant.isEmpty,
+              let obj = await fetchJSON("https://\(tenant).api.civicclerk.com/v1/Events?$filter=hasMedia%20eq%20true&$orderby=startDateTime%20desc&$top=40") as? [String: Any],
+              let events = obj["value"] as? [[String: Any]] else { return nil }
+        let entries = events.compactMap { e -> WatcherEntry? in
+            var media = e["externalMediaUrl"] as? String ?? ""
+            let streamPath = e["mediaStreamPath"] as? String ?? ""
+            if !media.hasPrefix("http"), streamPath.hasPrefix("http") {
+                media = streamPath
+            } else if !media.hasPrefix("http"), streamPath.hasPrefix("stream/"),
+                      let file = streamPath.split(separator: "/").last {
+                // Uploaded files: stream/<TENANT>/<file> lives in the tenant's
+                // container on CivicPlus's blob storage.
+                media = "https://cpmedia.blob.core.windows.net/\(tenant.lowercased())/\(file)"
+            }
+            if !media.hasPrefix("http"), let yt = e["youtubeVideoId"] as? String, !yt.isEmpty {
+                media = "https://www.youtube.com/watch?v=\(yt)"
+            }
+            guard media.hasPrefix("http") else { return nil }
+            let date = (e["startDateTime"] as? String).map { String($0.prefix(10)) } ?? ""
+            let name = (e["eventName"] as? String ?? "Meeting").trimmingCharacters(in: .whitespaces)
+            return WatcherEntry(id: "civicclerk:\(tenant):\(e["id"] ?? "")", title: "\(name), \(date)", mediaURL: media)
+        }
+        return entries.isEmpty ? nil : entries
+    }
+
+    /// Legistar's public Web API. EventMedia is a Granicus clip number on most
+    /// sites (played from <client>.granicus.com) or a full link on others.
+    static func legistarEntries(client: String) async -> [WatcherEntry]? {
+        guard !client.isEmpty else { return nil }
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        let today = df.string(from: Date().addingTimeInterval(86_400))
+        guard let events = await fetchJSON("https://webapi.legistar.com/v1/\(client)/events?$top=60&$orderby=EventDate%20desc&$filter=EventDate%20lt%20datetime'\(today)'") as? [[String: Any]] else { return nil }
+        let entries = events.compactMap { e -> WatcherEntry? in
+            guard let media = e["EventMedia"] as? String, !media.isEmpty else { return nil }
+            let mediaURL = media.hasPrefix("http") ? media
+                : media.allSatisfy(\.isNumber) ? "https://\(client).granicus.com/MediaPlayer.php?clip_id=\(media)" : nil
+            // Links to a city's own video site (Seattle Channel) need a player
+            // HearYe doesn't have; keep Granicus, YouTube, Vimeo and files.
+            guard let mediaURL, isFetchableMedia(mediaURL) else { return nil }
+            let date = (e["EventDate"] as? String).map { String($0.prefix(10)) } ?? ""
+            let body = (e["EventBodyName"] as? String ?? "Meeting").trimmingCharacters(in: .whitespaces)
+            return WatcherEntry(id: "legistar:\(client):\(e["EventId"] ?? media)", title: "\(body), \(date)", mediaURL: mediaURL)
+        }
+        return entries.isEmpty ? nil : entries
+    }
+
+    static func isFetchableMedia(_ link: String) -> Bool {
+        let l = link.lowercased()
+        return l.contains("granicus.com") || l.contains("youtube.com") || l.contains("youtu.be")
+            || l.contains("vimeo.com") || l.contains("swagit.com")
+            || l.range(of: #"\.(mp3|m4a|mp4|m4v|mov|wav|m3u8)(\?|$)"#, options: .regularExpression) != nil
+    }
+
+    /// Player pages to the stream inside them: Granicus MediaPlayer.php and
+    /// Swagit /videos/<id> pages both embed an HLS playlist. Anything else is
+    /// returned unchanged for yt-dlp.
+    static func resolvePlayable(_ mediaURL: String) -> String {
+        let lower = mediaURL.lowercased()
+        guard (lower.contains("granicus.com/mediaplayer.php") || lower.range(of: #"swagit\.com/videos/\d+$"#, options: .regularExpression) != nil),
+              let url = URL(string: mediaURL) else { return mediaURL }
+        func stream(from page: URL) -> String? {
+            var request = URLRequest(url: page, timeoutInterval: 30)
+            request.setValue(downloaderUserAgent, forHTTPHeaderField: "User-Agent")
+            let done = DispatchSemaphore(value: 0)
+            var html = ""
+            URLSession.shared.dataTask(with: request) { data, _, _ in
+                html = data.map { String(decoding: $0, as: UTF8.self) } ?? ""
+                done.signal()
+            }.resume()
+            _ = done.wait(timeout: .now() + 35)
+            return matches(#"(https?://[^"'\s<>]+?\.m3u8)"#, in: html).first
+        }
+        if let found = stream(from: url) { return found }
+        // Older Swagit archives (bryantx.swagit.com) link /videos/<id> pages
+        // that only exist on the newer host (bryantx.new.swagit.com).
+        if let host = url.host, host.hasSuffix(".swagit.com"), !host.hasSuffix(".new.swagit.com"),
+           let sub = host.split(separator: ".").first,
+           let newer = URL(string: "https://\(sub).new.swagit.com\(url.path)"),
+           let found = stream(from: newer) {
+            return found
+        }
+        return mediaURL
     }
 }
