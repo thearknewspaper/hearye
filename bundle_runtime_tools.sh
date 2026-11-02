@@ -42,9 +42,13 @@ if [[ -x /opt/homebrew/bin/yt-dlp && "$(file -b /opt/homebrew/bin/yt-dlp)" != *"
 fi
 PYTHON_PREFIX=""
 PYTHON_VERSION=""
-if [[ -d /opt/homebrew/opt/python@3.14/Frameworks/Python.framework ]]; then
-  PYTHON_PREFIX="$(realpath /opt/homebrew/opt/python@3.14)"
-  PYTHON_VERSION="$(basename "$(realpath "$PYTHON_PREFIX/Frameworks/Python.framework/Versions/Current")")"
+# Bundle the Python that Homebrew's yt-dlp was built against; brew moves it
+# to each new Python release on its own.
+YTDLP_PY="$(ls -d "$YTDLP_LIBEXEC"/lib/python3.* 2>/dev/null | tail -1)"
+YTDLP_PY="${YTDLP_PY##*/python}"
+if [[ -n "$YTDLP_PY" && -d /opt/homebrew/opt/python@$YTDLP_PY/Frameworks/Python.framework/Versions/$YTDLP_PY ]]; then
+  PYTHON_PREFIX="$(realpath /opt/homebrew/opt/python@$YTDLP_PY)"
+  PYTHON_VERSION="$YTDLP_PY"
 fi
 
 if [[ "$TARGET_ARCH" == arm64 && ! -x "$ARM_FFMPEG" ]]; then
@@ -72,8 +76,8 @@ if [[ "$TARGET_ARCH" == universal && (! -x "$ARM_DENO" || ! -x "$X86_DENO") ]]; 
   exit 1
 fi
 if [[ "$TARGET_ARCH" == arm64 && ( -z "$YTDLP_SCRIPT" || -z "$PYTHON_PREFIX" || -z "$PYTHON_VERSION" ) ]]; then
-  echo "This arm64 build needs Homebrew yt-dlp plus Python 3.14 so the runtime can be bundled and signed." >&2
-  echo "Install them with: brew install yt-dlp python@3.14" >&2
+  echo "This arm64 build needs Homebrew yt-dlp plus the Python it was built on so the runtime can be bundled and signed." >&2
+  echo "Install them with: brew install yt-dlp python@${YTDLP_PY:-3}" >&2
   exit 1
 fi
 if [[ "$TARGET_ARCH" != arm64 && -z "$YTDLP" ]]; then
