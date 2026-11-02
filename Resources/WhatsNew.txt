@@ -1,3 +1,4 @@
+• Updates download and install themselves: HearYe fetches a new version in the background, checks that it's signed and notarized, and swaps it in when you quit (or click Install and Relaunch in About HearYe). Turn it off there.
 • Agendas and full packets: each watched meeting gets its own folder, with every document named for its agenda item, saved as soon as the agenda is posted. At meeting time HearYe checks again for late mail and other additions, and the recording's audio joins the same folder.
 • Watches PrimeGov's newer "OneMeeting" portals, such as Marin County's.
 • Watch the meeting systems cities and school districts actually use: Swagit, Legistar, PrimeGov, CivicClerk, BoardDocs, ProudCity city sites and Cablecast pages, alongside Granicus and YouTube. Paste the system's public page and HearYe finds the recordings.

@@ -1212,7 +1212,7 @@ private enum MeetingWatcher {
     }
 
     /// The Ark edition keeps its historical folder so existing watch lists
-    /// carry over; any other edition (the free one) gets its own, so the two
+    /// carry over; any other edition (the public one) gets its own, so the two
     /// on one Mac never share a watch list or race each other's downloads.
     static var stateFolderName: String {
         let id = Bundle.main.bundleIdentifier ?? "com.kevin.hearye"
@@ -2120,7 +2120,7 @@ private final class WatcherModel: ObservableObject {
     /// ticking one needs no network lookup. None is watched until ticked.
     static let presetChannels: [WatchedChannel] = {
         // Each edition ships its own ready-made list in Sources.json (the
-        // Ark's home-beat bodies; none for the free edition).
+        // Ark's home-beat bodies; none for the public edition).
         guard let url = Bundle.main.url(forResource: "Sources", withExtension: "json"),
               let data = try? Data(contentsOf: url),
               let list = try? JSONDecoder().decode([WatchedChannel].self, from: data) else { return [] }

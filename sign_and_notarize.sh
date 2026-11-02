@@ -10,7 +10,7 @@ DIST_DIR="$SCRIPT_DIR/dist"
 PLIST="$APP_DIR/Contents/Info.plist"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
 TARGET_ARCH="${3:-universal}"
-# The built bundle says which edition it is; the free one is named -Public.
+# The built bundle says which edition it is; the public one is named -Public.
 EDITION_TAG=""
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :NewsroomEdition' "$PLIST" 2>/dev/null)" == "public" ]] && EDITION_TAG="-Public"
 ARCHIVE="$DIST_DIR/HearYe$EDITION_TAG-$VERSION-macOS-$TARGET_ARCH.zip"

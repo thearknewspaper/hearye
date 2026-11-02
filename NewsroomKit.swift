@@ -11,6 +11,7 @@
 //    NewsroomRepoURL       its GitHub repo (issues), or empty
 //    NewsroomUpdateFeed    a GitHub "latest release" API URL, or empty
 //    NewsroomSupportEmail  where problem reports go when there is no repo
+//    NewsroomUpdateToken   read-only GitHub token for a private release repo, or empty
 //
 
 import SwiftUI
@@ -28,11 +29,12 @@ enum AppIdentity {
     static var build: String { info("CFBundleVersion") }
     static var edition: String { info("NewsroomEdition").isEmpty ? "ark" : info("NewsroomEdition") }
     static var isPublic: Bool { edition == "public" }
-    static var editionLabel: String { isPublic ? "Free edition" : "The Ark edition" }
+    static var editionLabel: String { isPublic ? "Public edition" : "The Ark edition" }
     static var projectURL: URL? { url("NewsroomProjectURL") }
     static var repoURL: URL? { url("NewsroomRepoURL") }
     static var updateFeed: URL? { url("NewsroomUpdateFeed") }
     static var supportEmail: String { info("NewsroomSupportEmail") }
+    static var updateToken: String { info("NewsroomUpdateToken") }
     static var macOS: String {
         let v = ProcessInfo.processInfo.operatingSystemVersion
         return "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
@@ -63,36 +65,57 @@ enum AppIdentity {
 
 // MARK: - Update check
 
-/// Asks the edition's release feed whether a newer version exists. Only the
-/// version comparison happens here; downloading stays a click in the browser,
-/// so nothing is ever installed behind the user's back.
+/// Asks the edition's release feed whether a newer version exists and, with
+/// automatic updates on (the default), downloads it in the background. The
+/// download is installed only if it is signed by the same Developer ID team as
+/// the running app and Gatekeeper accepts it; it replaces this copy when the
+/// app quits, or at once from "Install and Relaunch".
 @MainActor final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
 
     enum State: Equatable {
         case idle, checking, current
         case available(version: String, page: URL)
+        case downloading(version: String)
+        case ready(version: String)
         case failed(String)
     }
     @Published var state: State = .idle
+    @Published var autoInstall: Bool = UserDefaults.standard.object(forKey: autoKey) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoInstall, forKey: Self.autoKey) }
+    }
 
     private let lastCheckKey = "newsroomLastUpdateCheck"
+    private static let autoKey = "newsroomAutoInstallUpdates"
+    /// The verified new app, waiting to replace this one.
+    private var staged: URL?
+    private var quitHook: NSObjectProtocol?
 
     var isAvailable: Bool { AppIdentity.updateFeed != nil }
 
-    /// Once a day at most, quietly, at launch.
+    /// At launch, then every six hours while the app stays open.
     func checkInBackgroundIfDue() {
         guard isAvailable else { return }
         let last = UserDefaults.standard.double(forKey: lastCheckKey)
-        guard Date().timeIntervalSince1970 - last > 86_400 else { return }
-        Task { await check() }
+        if Date().timeIntervalSince1970 - last > 21_600 { Task { await check() } }
+        Task { [weak self] in
+            while true {
+                try? await Task.sleep(for: .seconds(21_600))
+                guard let self else { return }
+                if case .ready = self.state { return }
+                await self.check()
+            }
+        }
     }
 
     func check() async {
         guard let feed = AppIdentity.updateFeed else { return }
+        if case .downloading = state { return }
+        if case .ready = state { return }
         state = .checking
         var req = URLRequest(url: feed, timeoutInterval: 15)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        Self.authorize(&req)
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             if (resp as? HTTPURLResponse)?.statusCode == 404 {
@@ -108,16 +131,129 @@ enum AppIdentity {
             }
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
             let latest = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-            if Self.isNewer(latest, than: AppIdentity.version) {
-                let page = (obj["html_url"] as? String).flatMap(URL.init(string:)) ?? feed
-                state = .available(version: latest, page: page)
-            } else {
-                state = .current
-            }
+            guard Self.isNewer(latest, than: AppIdentity.version) else { state = .current; return }
+            let page = (obj["html_url"] as? String).flatMap(URL.init(string:)) ?? feed
+            state = .available(version: latest, page: page)
+            if autoInstall, let zip = Self.asset(in: obj) { await download(zip, version: latest, page: page) }
         } catch {
             state = .failed("Couldn't reach the release page. Check the connection and try again.")
         }
     }
+
+    /// A private release repo needs its read-only token on every request.
+    private static func authorize(_ req: inout URLRequest) {
+        let token = AppIdentity.updateToken
+        if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    }
+
+    /// This edition's app archive among the release's files: HearYe-<v>-macOS-…zip
+    /// for the Ark edition, HearYe-Public-<v>-… for the public one.
+    private static func asset(in release: [String: Any]) -> URL? {
+        let prefix = AppIdentity.name + (AppIdentity.isPublic ? "-Public-" : "-")
+        let assets = release["assets"] as? [[String: Any]] ?? []
+        return assets.first { a in
+            let n = a["name"] as? String ?? ""
+            return n.hasPrefix(prefix) && n.hasSuffix(".zip") && n.dropFirst(prefix.count).first?.isNumber == true
+        }.flatMap { a in
+            // A private repo's public download link answers 404; its API URL serves the file.
+            let key = AppIdentity.updateToken.isEmpty ? "browser_download_url" : "url"
+            return (a[key] as? String).flatMap(URL.init(string:))
+        }
+    }
+
+    func download(_ zip: URL, version: String, page: URL) async {
+        state = .downloading(version: version)
+        do {
+            var req = URLRequest(url: zip, timeoutInterval: 600)
+            req.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+            Self.authorize(&req)
+            let (file, resp) = try await URLSession.shared.download(for: req, delegate: DropAuthOnRedirect())
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError("download failed") }
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("update-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let app = try await Task.detached { () throws -> URL in
+                try Self.run("/usr/bin/ditto", ["-x", "-k", file.path, dir.path])
+                guard let found = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+                        .first(where: { $0.pathExtension == "app" }) else { throw UpdateError("no app in the archive") }
+                try Self.verify(found)
+                return found
+            }.value
+            staged = app
+            state = .ready(version: version)
+            if quitHook == nil {
+                quitHook = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                                                  object: nil, queue: .main) { _ in
+                    MainActor.assumeIsolated { UpdateChecker.shared.install(relaunch: false) }
+                }
+            }
+        } catch {
+            // Fall back to the manual download link.
+            state = .available(version: version, page: page)
+        }
+    }
+
+    /// Swaps the staged app in once this process has exited, keeping the old
+    /// copy in the Trash, and reopens it if asked.
+    func install(relaunch: Bool) {
+        guard let staged else { return }
+        self.staged = nil
+        let target = Bundle.main.bundleURL.path
+        let trash = (NSHomeDirectory() as NSString).appendingPathComponent(".Trash/\(AppIdentity.name) \(AppIdentity.version).app")
+        let script = """
+        while /bin/kill -0 $3 2>/dev/null; do sleep 0.2; done
+        /bin/rm -rf "$4"; /bin/mv "$1" "$4" && /bin/mv "$0" "$1" || /bin/mv "$4" "$1"
+        /usr/bin/xattr -dr com.apple.quarantine "$1" 2>/dev/null
+        [ "$2" = 1 ] && /usr/bin/open "$1"
+        """
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", script, staged.path, target, relaunch ? "1" : "0",
+                          String(ProcessInfo.processInfo.processIdentifier), trash]
+        try? task.run()
+        if relaunch {
+            for window in NSApp.windows { for sheet in window.sheets { window.endSheet(sheet) } }
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+    }
+
+    /// Same signing team as this app, and accepted by Gatekeeper (notarized).
+    nonisolated private static func verify(_ app: URL) throws {
+        func team(_ path: String) -> String? {
+            let out = (try? output("/usr/bin/codesign", ["-dv", path])) ?? ""
+            return out.split(separator: "\n").first { $0.hasPrefix("TeamIdentifier=") }
+                .map { String($0.dropFirst("TeamIdentifier=".count)) }
+        }
+        guard let mine = team(Bundle.main.bundlePath), mine != "not set", team(app.path) == mine
+        else { throw UpdateError("the download isn't signed by the same developer") }
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        try run("/usr/sbin/spctl", ["-a", "-t", "exec", app.path])
+    }
+
+    nonisolated private static func output(_ tool: String, _ args: [String]) throws -> String {
+        let p = Process(); let pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: tool); p.arguments = args
+        p.standardOutput = pipe; p.standardError = pipe
+        try p.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { throw UpdateError("\(tool) failed") }
+        return String(decoding: data, as: UTF8.self)
+    }
+    nonisolated private static func run(_ tool: String, _ args: [String]) throws { _ = try output(tool, args) }
+
+    /// GitHub hands the file off to storage that refuses the GitHub token.
+    private final class DropAuthOnRedirect: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest) async -> URLRequest? {
+            var next = request
+            if request.url?.host != task.originalRequest?.url?.host {
+                next.setValue(nil, forHTTPHeaderField: "Authorization")
+            }
+            return next
+        }
+    }
+
+    struct UpdateError: Error { let message: String; init(_ m: String) { message = m } }
 
     /// Numeric, part by part: 1.10.0 is newer than 1.9.2.
     nonisolated static func isNewer(_ a: String, than b: String) -> Bool {
@@ -308,15 +444,25 @@ struct UpdateStatusRow: View {
                 Image(systemName: "arrow.down.circle").foregroundStyle(.blue)
                 Text("Version \(v) is available.")
                 Button("Download…") { NSWorkspace.shared.open(page) }
+            case .downloading(let v):
+                ProgressView().controlSize(.small)
+                Text("Downloading version \(v)…")
+            case .ready(let v):
+                Image(systemName: "arrow.down.circle.fill").foregroundStyle(.blue)
+                Text("Version \(v) installs when you quit.")
+                Button("Install and Relaunch") { updates.install(relaunch: true) }
             case .failed(let msg):
                 Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
                 Text(msg)
             }
-            if updates.state != .checking {
-                Button("Check for Updates") { Task { await updates.check() } }
+            switch updates.state {
+            case .checking, .downloading, .ready: EmptyView()
+            default: Button("Check for Updates") { Task { await updates.check() } }
             }
         }
         .font(.system(size: 11))
+        Toggle("Download and install updates automatically", isOn: $updates.autoInstall)
+            .toggleStyle(.checkbox).font(.system(size: 11))
     }
 }
 

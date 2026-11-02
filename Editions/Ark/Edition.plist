@@ -4,6 +4,7 @@
 <key>NewsroomEdition</key><string>ark</string>
 <key>NewsroomProjectURL</key><string>https://www.kevinhessel.com/hearye</string>
 <key>NewsroomRepoURL</key><string></string>
-<key>NewsroomUpdateFeed</key><string></string>
+<key>NewsroomUpdateFeed</key><string>https://api.github.com/repos/thearknewspaper/hearye-ark/releases/latest</string>
+<key>NewsroomUpdateToken</key><string>hearye-ark-updates</string>
 <key>NewsroomSupportEmail</key><string></string>
 </dict></plist>

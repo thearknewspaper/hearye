@@ -67,9 +67,14 @@ esac
 
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$CONTENTS_DIR/Info.plist"
-for key in NewsroomEdition NewsroomProjectURL NewsroomRepoURL NewsroomUpdateFeed NewsroomSupportEmail; do
+for key in NewsroomEdition NewsroomProjectURL NewsroomRepoURL NewsroomUpdateFeed NewsroomSupportEmail NewsroomUpdateToken; do
   val="$(/usr/libexec/PlistBuddy -c "Print :$key" "$EDITION_DIR/Edition.plist" 2>/dev/null || true)"
   /usr/libexec/PlistBuddy -c "Delete :$key" "$CONTENTS_DIR/Info.plist" 2>/dev/null || true
+  # A private release repo's read-only token lives in the Keychain, never in the source tree.
+  if [[ "$key" == NewsroomUpdateToken && -n "$val" ]]; then
+    val="$(security find-generic-password -s "$val" -w 2>/dev/null || true)"
+    [[ -z "$val" ]] && echo "warning: no Keychain token for updates; this build can't update itself" >&2
+  fi
   /usr/libexec/PlistBuddy -c "Add :$key string $val" "$CONTENTS_DIR/Info.plist"
 done
 cp "$EDITION_DIR/Sources.json" "$RESOURCES_DIR/Sources.json"

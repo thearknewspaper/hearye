@@ -16,7 +16,7 @@ Apple Silicon, macOS 13 or later.
 
 ## Editions
 
-| | Free edition | The Ark edition |
+| | Public edition | The Ark edition |
 |---|---|---|
 | Bundle ID | `com.kevinhessel.hearye` | `com.kevin.hearye` |
 | Ready-made sources | None — add your own | Tiburon, Belvedere, Reed Union, Marin BOS |
@@ -223,7 +223,7 @@ second x86_64 Homebrew in `/usr/local`.
 ```sh
 brew install yt-dlp ffmpeg deno
 ./build_release.sh arm64                  # the Ark edition
-EDITION=public ./build_release.sh arm64   # the free edition
+EDITION=public ./build_release.sh arm64   # the public edition
 ```
 
 This creates `dist/HearYe-2.2.0-macOS-arm64.zip` (or `HearYe-Public-…`) and its SHA-256 file.
