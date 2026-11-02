@@ -1120,6 +1120,10 @@ private struct WatchedChannel: Codable, Identifiable, Equatable {
     var kind: String? = nil
     /// For "podcast": the feed to poll, when it differs from the landing page.
     var feedURL: String? = nil
+    /// Where this body posts agendas, when it isn't the recordings source:
+    /// a PrimeGov, Granicus, Legistar or WordPress-meetings site. nil = work
+    /// it out from the recordings source, if that platform carries agendas.
+    var agendaURL: String? = nil
 
     var sourceKind: String { kind ?? "youtube" }
 
@@ -1167,6 +1171,26 @@ private struct WatcherState: Codable {
     var outputFolder: String?
     /// An app to open each new file in (e.g. a transcription app); nil = none.
     var openWithApp: String?
+    /// Save agendas and full packets as they're posted; nil (older state
+    /// files) means on.
+    var saveAgendas: Bool?
+    /// meeting key -> what has been saved for that meeting's agenda.
+    var agendas: [String: AgendaRecord]?
+}
+
+/// One meeting's saved agenda: the documents already in its folder, and
+/// whether the meeting-time recheck (late mail, supplemental items) has run.
+private struct AgendaRecord: Codable {
+    var board: String
+    var title: String
+    var start: Date?
+    var folder: String
+    var saved: [String]
+    /// File names in the folder, in the order they were saved.
+    var files: [String] = []
+    var rechecked = false
+    /// yyyy-MM-dd of the meeting, for pruning old records.
+    var date: String = ""
 }
 
 /// The headless half of channel watching. launchd re-runs the app's own
@@ -1764,9 +1788,11 @@ private enum MeetingWatcher {
         return (fields[0], published)
     }
 
-    static func downloadAudio(mediaURL: String, title: String, channelTitle: String) -> Bool {
+    /// `folder`: the meeting's agenda folder, when it is still there; else
+    /// the save folder.
+    static func downloadAudio(mediaURL: String, title: String, channelTitle: String, into folder: URL? = nil) -> Bool {
         guard let ffmpegPath = bundledExecutable(named: "ffmpeg") else { return false }
-        let downloads = outputDirectory()
+        let downloads = folder ?? outputDirectory()
         try? FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
         let base = uniqueAudioBaseName(sanitizedBaseName(title), extension: "m4a", in: downloads)
         let outputURL = downloads.appendingPathComponent("\(base).m4a")
@@ -1844,6 +1870,11 @@ private enum MeetingWatcher {
     /// permission these default to the persistent style — on screen until
     /// dismissed, not a banner that slides away while nobody is at the desk.
     static func alert(title: String, body: String) async {
+        // Test runs (HEARYE_HOME sandboxes) print alerts instead of posting them.
+        if ProcessInfo.processInfo.environment["HEARYE_PRINT_ALERTS"] != nil {
+            print("ALERT: \(title) — \(body)")
+            return
+        }
         // Notification Center only accepts posts from an instance of the app
         // that LaunchServices launched — not from this launchd-run watcher
         // process. So hand the alert to a fresh, launched instance, which
@@ -1961,13 +1992,16 @@ private enum MeetingWatcher {
                     }
                 }
                 let mediaURL = entry.mediaURL ?? "https://www.youtube.com/watch?v=\(entry.id)"
-                if canDownload, downloadAudio(mediaURL: mediaURL, title: entry.title, channelTitle: channel.title) {
+                // Beside the meeting's agenda documents, if that folder is
+                // still in the save folder; otherwise in the save folder itself.
+                let meetingFolder = agendaFolder(for: entry.title, channel: channel, state: state)
+                if canDownload, downloadAudio(mediaURL: mediaURL, title: entry.title, channelTitle: channel.title, into: meetingFolder) {
                     seenIDs.append(entry.id)
                     state.attempts.removeValue(forKey: entry.id)
                     savedCount += 1
                     await alert(
                         title: "New \(channel.title) meeting saved",
-                        body: "\(entry.title) — audio is in \(displayPath(outputDirectory()))."
+                        body: "\(entry.title) — audio is in \(displayPath(meetingFolder ?? outputDirectory()))."
                     )
                     continue
                 }
@@ -1994,6 +2028,10 @@ private enum MeetingWatcher {
                 line += ", \(backlogCount) older skipped"
             }
             summary.append(line)
+        }
+
+        if state.saveAgendas ?? true {
+            summary += await runAgendas(&state)
         }
 
         state.lastCheck = Date()
@@ -2138,6 +2176,11 @@ private final class WatcherModel: ObservableObject {
 
     var enabledBinding: Binding<Bool> {
         Binding(get: { self.state.enabled }, set: { self.setEnabled($0) })
+    }
+
+    var agendasBinding: Binding<Bool> {
+        Binding(get: { self.state.saveAgendas ?? true },
+                set: { self.state.saveAgendas = $0; self.persist() })
     }
 
     var intervalBinding: Binding<Int> {
@@ -2293,6 +2336,7 @@ private final class WatcherModel: ObservableObject {
         merged.channels = state.channels
         merged.outputFolder = state.outputFolder
         merged.openWithApp = state.openWithApp
+        merged.saveAgendas = state.saveAgendas
         merged.seen = merged.seen.filter { key, _ in state.channels.contains { $0.channelId == key } }
         merged.watchingSince = merged.watchingSince?.filter { key, _ in state.channels.contains { $0.channelId == key } }
         MeetingWatcher.saveState(merged)
@@ -2437,6 +2481,10 @@ private struct WatcherSectionView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+
+                Toggle("Also save agendas and full packets when they're posted, and check again at meeting time for late documents",
+                       isOn: model.agendasBinding)
+                    .font(.subheadline)
 
                 HStack {
                     Picker("Check every", selection: model.intervalBinding) {
@@ -3033,12 +3081,24 @@ extension MeetingWatcher {
     /// newest first, keeping the ones with a video link.
     static func primeGovEntries(host: String) async -> [WatcherEntry]? {
         guard !host.isEmpty else { return nil }
+        let host = primeGovAPIHost(host)
         let year = Calendar.current.component(.year, from: Date())
         var meetings: [[String: Any]] = []
         for y in [year, year - 1] {
             if let list = await fetchJSON("https://\(host)/api/v2/PublicPortal/ListArchivedMeetings?year=\(y)") as? [[String: Any]] {
                 meetings += list
             }
+        }
+        // Newer "OneMeeting" portals (Marin County, Sept. 2026) dropped the
+        // by-year list; they answer by days back instead.
+        if meetings.isEmpty, let list = await fetchJSON("https://\(host)/api/v2/PublicPortal/ListArchivedMeetingsByDays?days=730") as? [[String: Any]] {
+            meetings = list
+        }
+        // Their video links are protocol-relative (//marin.granicus.com/…).
+        meetings = meetings.map { m in
+            var m = m
+            if let v = m["videoUrl"] as? String, v.hasPrefix("//") { m["videoUrl"] = "https:" + v }
+            return m
         }
         let entries = meetings
             .filter { ($0["videoUrl"] as? String)?.hasPrefix("http") == true }
@@ -3209,5 +3269,454 @@ extension MeetingWatcher {
             return found
         }
         return mediaURL
+    }
+}
+
+// MARK: - Agendas and packets
+
+private struct AgendaDoc {
+    let name: String
+    let url: String
+    /// The agenda item the document belongs to ("CC-1", "CA-1.a"); nil for
+    /// the agenda and packet themselves.
+    var item: String? = nil
+}
+
+private struct AgendaMeeting {
+    let key: String
+    let title: String
+    /// yyyy-MM-dd
+    let date: String
+    var start: Date?
+    /// The meeting's own page, read for attachments and the start time.
+    var page: String?
+    var docs: [AgendaDoc]
+    /// The platform publishes its own full packet (PrimeGov). Either way
+    /// every document is saved too, named for its agenda item. (Binding
+    /// them into one PDF with PDFKit or Core Graphics re-encodes the scans
+    /// at about three times the size, so HearYe doesn't.)
+    var hasPacket = false
+}
+
+/// Watches the same bodies' agenda sites: saves each agenda and its full
+/// packet into a folder per meeting as soon as they're posted, then reads the
+/// meeting again at its start time and saves anything added since — late
+/// mail, supplemental items, revised staff reports — with an alert.
+extension MeetingWatcher {
+
+    /// The edition's Sources.json, read here because WatcherModel's copy is
+    /// main-actor bound. Lets an older watch list pick up an agenda site the
+    /// preset gained later.
+    static let bundledSources: [WatchedChannel] = {
+        guard let url = Bundle.main.url(forResource: "Sources", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let list = try? JSONDecoder().decode([WatchedChannel].self, from: data) else { return [] }
+        return list
+    }()
+
+    /// "portal-marincounty.primegov.com" serves the page; the API answers on
+    /// "marincounty.primegov.com".
+    static func primeGovAPIHost(_ host: String) -> String {
+        host.hasPrefix("portal-") ? String(host.dropFirst("portal-".count)) : host
+    }
+
+    /// Where a channel's agendas are posted: its own agenda site, the
+    /// preset's, or the recordings platform when that carries agendas too.
+    static func agendaSource(for channel: WatchedChannel) -> URL? {
+        if let a = channel.agendaURL ?? bundledSources.first(where: { $0.channelId == channel.channelId })?.agendaURL {
+            return URL(string: a)
+        }
+        let feed = channel.feedURL ?? ""
+        switch channel.sourceKind {
+        case "primegov", "proudcity": return URL(string: "https://\(feed)/")
+        case "legistar": return URL(string: "https://\(feed).legistar.com/")
+        case "podcast":
+            // A Granicus podcast feed's view also lists its agendas.
+            guard let u = URL(string: feed), let host = u.host, host.hasSuffix(".granicus.com"),
+                  let view = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "view_id" })?.value
+            else { return nil }
+            return URL(string: "https://\(host)/ViewPublisher.php?view_id=\(view)")
+        default: return nil
+        }
+    }
+
+    static func fetchAgendaMeetings(_ source: URL) async -> [AgendaMeeting]? {
+        guard let host = source.host?.lowercased() else { return nil }
+        let query = URLComponents(url: source, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        if host.hasSuffix(".primegov.com") {
+            return await primeGovAgendas(host: primeGovAPIHost(host),
+                                         committee: query.first(where: { $0.name.lowercased() == "committeeid" })?.value)
+        }
+        if host.hasSuffix(".granicus.com") {
+            return await granicusAgendas(host: host, view: query.first(where: { $0.name == "view_id" })?.value ?? "1")
+        }
+        if host.hasSuffix(".legistar.com") {
+            return await legistarAgendas(client: String(host.split(separator: ".")[0]))
+        }
+        return await wordPressAgendas(host: host)
+    }
+
+    // MARK: Platforms
+
+    static let localStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return f
+    }()
+
+    /// "Nov 5 6.42 PM" — colons can't go in file names.
+    static let addedStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM d h.mm a"
+        return f
+    }()
+
+    static let dayStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    /// yyyy-MM-dd from "Nov 05, 2026", "November 9, 2026" or "11/09/2026".
+    static func isoDate(in text: String) -> String? {
+        let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        let pattern = #"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+           let m = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+           let mon = Range(m.range(at: 1), in: text), let day = Range(m.range(at: 2), in: text), let year = Range(m.range(at: 3), in: text),
+           let index = months.firstIndex(of: text[mon].prefix(3).lowercased()), let d = Int(text[day]) {
+            return String(format: "%@-%02d-%02d", String(text[year]), index + 1, d)
+        }
+        if let regex = try? NSRegularExpression(pattern: #"\b(\d{1,2})/(\d{1,2})/(\d{4})"#),
+           let m = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+           let mo = Range(m.range(at: 1), in: text), let d = Range(m.range(at: 2), in: text), let y = Range(m.range(at: 3), in: text),
+           let month = Int(text[mo]), let day = Int(text[d]) {
+            return String(format: "%@-%02d-%02d", String(text[y]), month, day)
+        }
+        return nil
+    }
+
+    /// The first clock time in a page ("6:30 p.m.", "03:00 pm") on `date`.
+    static func startTime(in text: String, date: String) -> Date? {
+        guard let regex = try? NSRegularExpression(pattern: #"\b(\d{1,2}):(\d{2})\s*([ap])\.?\s?m\b"#, options: [.caseInsensitive]),
+              let m = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let h = Range(m.range(at: 1), in: text), let mi = Range(m.range(at: 2), in: text), let ap = Range(m.range(at: 3), in: text),
+              var hour = Int(text[h]), let minute = Int(text[mi]), hour <= 12, minute < 60 else { return nil }
+        hour %= 12
+        if text[ap].lowercased() == "p" { hour += 12 }
+        return localStamp.date(from: String(format: "%@T%02d:%02d:00", date, hour, minute))
+    }
+
+    /// PrimeGov: upcoming meetings plus the last few days of the archive (a
+    /// meeting moves there once it starts, which is when it's read again).
+    /// Each published document is a compiled agenda (HTML) or PDF, the full
+    /// packet among them; item attachments are links in the HTML agenda.
+    static func primeGovAgendas(host: String, committee: String?) async -> [AgendaMeeting]? {
+        var meetings: [[String: Any]] = []
+        var answered = false
+        for path in ["ListUpcomingMeetings", "ListArchivedMeetingsByDays?days=3"] {
+            if let list = await fetchJSON("https://\(host)/api/v2/PublicPortal/\(path)") as? [[String: Any]] {
+                answered = true
+                meetings += list
+            }
+        }
+        guard answered else { return nil }
+        var seen = Set<String>()
+        return meetings.compactMap { m -> AgendaMeeting? in
+            let id = "\(m["id"] ?? "")"
+            guard !seen.contains(id) else { return nil }
+            seen.insert(id)
+            if let committee, "\(m["committeeId"] ?? "")" != committee { return nil }
+            let title = (m["title"] as? String ?? "Meeting").trimmingCharacters(in: .whitespaces)
+            if title.lowercased().hasPrefix("test") { return nil }
+            let stamp = m["dateTime"] as? String ?? ""
+            var docs: [AgendaDoc] = []
+            var page: String?
+            for d in m["documentList"] as? [[String: Any]] ?? [] {
+                let name = (d["templateName"] as? String ?? "Document").trimmingCharacters(in: .whitespaces)
+                let template = "\(d["templateId"] ?? "")"
+                switch d["compileOutputType"] as? Int {
+                case 1:
+                    docs.append(AgendaDoc(name: name, url: "https://\(host)/Public/CompiledDocument?meetingTemplateId=\(template)&compileOutputType=1"))
+                case 3:
+                    let url = "https://\(host)/Portal/Meeting?meetingTemplateId=\(template)"
+                    if page == nil, name.lowercased().contains("agenda") { page = url }
+                    docs.append(AgendaDoc(name: name, url: url))
+                default: break
+                }
+            }
+            return AgendaMeeting(key: "primegov:\(host):\(id)", title: title, date: String(stamp.prefix(10)),
+                                 start: localStamp.date(from: String(stamp.prefix(19))), page: page, docs: docs,
+                                 hasPacket: docs.contains { $0.name.lowercased().contains("packet") })
+        }
+    }
+
+    /// Granicus: the view's agenda feed. Each agenda page links the item
+    /// attachments (MetaViewer.php) and says when the meeting starts.
+    static func granicusAgendas(host: String, view: String) async -> [AgendaMeeting]? {
+        guard let xml = await fetchText("https://\(host)/ViewPublisherRSS.php?view_id=\(view)&mode=agendas") else { return nil }
+        return xml.components(separatedBy: "<item>").dropFirst().compactMap { item -> AgendaMeeting? in
+            guard let title = matches(#"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>"#, in: item).first.map(decodeEntities),
+                  let link = matches(#"<link>(.*?)</link>"#, in: item).first.map(decodeEntities),
+                  let date = isoDate(in: title), !title.lowercased().contains("cancel") else { return nil }
+            let event = matches(#"(?:event_id|clip_id)=(\d+)"#, in: link).first ?? link
+            return AgendaMeeting(key: "granicus:\(host):\(event)", title: title, date: date, start: nil, page: link,
+                                 docs: [AgendaDoc(name: "Agenda", url: link)])
+        }
+    }
+
+    /// Legistar's Web API: the agenda file, and the start time it lists.
+    static func legistarAgendas(client: String) async -> [AgendaMeeting]? {
+        let from = dayStamp.string(from: Date().addingTimeInterval(-2 * 86_400))
+        guard let events = await fetchJSON("https://webapi.legistar.com/v1/\(client)/events?$top=40&$orderby=EventDate%20desc&$filter=EventDate%20ge%20datetime'\(from)'") as? [[String: Any]] else { return nil }
+        return events.compactMap { e -> AgendaMeeting? in
+            let date = String((e["EventDate"] as? String ?? "").prefix(10))
+            guard !date.isEmpty else { return nil }
+            let body = (e["EventBodyName"] as? String ?? "Meeting").trimmingCharacters(in: .whitespaces)
+            var docs: [AgendaDoc] = []
+            if let agenda = e["EventAgendaFile"] as? String, agenda.hasPrefix("http") { docs.append(AgendaDoc(name: "Agenda", url: agenda)) }
+            return AgendaMeeting(key: "legistar:\(client):\(e["EventId"] ?? date)", title: "\(body) - \(date)", date: date,
+                                 start: startTime(in: e["EventTime"] as? String ?? "", date: date),
+                                 page: e["EventInSiteURL"] as? String, docs: docs)
+        }
+    }
+
+    /// WordPress sites that post each meeting as a "meeting" (ProudCity,
+    /// Belvedere): the post goes up early, the agenda PDFs are added to its
+    /// page later, so the page itself is the document list.
+    static func wordPressAgendas(host: String) async -> [AgendaMeeting]? {
+        guard let text = await fetchText("https://\(host)/wp-json/wp/v2/meetings?per_page=30&_fields=id,link,title"),
+              let list = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]] else { return nil }
+        return list.compactMap { m -> AgendaMeeting? in
+            let title = decodeEntities((m["title"] as? [String: Any])?["rendered"] as? String ?? "")
+            guard let link = m["link"] as? String, let date = isoDate(in: title),
+                  !title.lowercased().contains("cancel") else { return nil }
+            return AgendaMeeting(key: "wp:\(host):\(m["id"] ?? link)", title: title, date: date, start: nil, page: link, docs: [])
+        }
+    }
+
+    static func decodeEntities(_ s: String) -> String {
+        s.replacingOccurrences(of: "&amp;", with: "&").replacingOccurrences(of: "&#038;", with: "&")
+            .replacingOccurrences(of: "&#8211;", with: "–").replacingOccurrences(of: "&#8217;", with: "’")
+            .replacingOccurrences(of: "&quot;", with: "\"").replacingOccurrences(of: "&#039;", with: "'")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Reads the meeting's page for the documents linked from it and, when the
+    /// listing didn't say, the start time.
+    static func withPageDocuments(_ meeting: AgendaMeeting) async -> AgendaMeeting {
+        guard let page = meeting.page, let base = URL(string: page), let html = await fetchText(page, timeout: 60) else { return meeting }
+        var m = meeting
+        if m.start == nil {
+            let text = html.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+            m.start = startTime(in: text, date: m.date)
+        }
+        m.docs += attachments(in: html, base: base, skipping: Set(m.docs.map(\.url)))
+        return m
+    }
+
+    /// Every document linked from an agenda page, in agenda order, each
+    /// tagged with the item number it sits under. Item numbers are short
+    /// cells or paragraphs of their own: Granicus "CC-1", "PH-2"; PrimeGov
+    /// "CA – 1." then "a." beneath it (→ "CA-1.a"); plain "4." and "B.".
+    static func attachments(in html: String, base: URL, skipping known: Set<String>) -> [AgendaDoc] {
+        let link = #"href\s*=\s*["']([^"']*(?:historyattachment/\?historyId=[0-9a-fA-F-]+|MetaViewer\.php\?[^"']+|\.pdf(?:\?[^"']*)?))["']"#
+        let number = #"<(?:td|p|span|strong|div)\b[^>]*>\s*(?:<[^>]+>\s*)*((?:[A-Z]{1,4}\s*[-–]\s*)?\d{1,2}(?:\.\d{1,2})?|[A-Za-z])[.)]?\s*(?:<[^>]+>\s*)*</(?:td|p|span|strong|div)>"#
+        guard let linkRx = try? NSRegularExpression(pattern: link, options: [.caseInsensitive]),
+              let numberRx = try? NSRegularExpression(pattern: number) else { return [] }
+        let all = NSRange(html.startIndex..., in: html)
+        // (offset, item number) and (offset, link), merged in page order.
+        var marks: [(Int, String)] = numberRx.matches(in: html, range: all).compactMap { m in
+            Range(m.range(at: 1), in: html).map { (m.range.location, String(html[$0])) }
+        }
+        marks.sort { $0.0 < $1.0 }
+        var docs: [AgendaDoc] = []
+        var seen = known
+        var top: String?, current: String?
+        var markIndex = 0
+        for m in linkRx.matches(in: html, range: all) {
+            while markIndex < marks.count, marks[markIndex].0 < m.range.location {
+                let raw = marks[markIndex].1.replacingOccurrences(of: #"\s*[-–]\s*"#, with: "-", options: .regularExpression)
+                if raw.count == 1, raw.first!.isLetter {
+                    // A lettered sub-item belongs to the last numbered one.
+                    current = top.map { "\($0).\(raw.lowercased())" } ?? raw.uppercased()
+                } else {
+                    top = raw
+                    current = raw
+                }
+                markIndex += 1
+            }
+            guard let r = Range(m.range(at: 1), in: html),
+                  let url = URL(string: decodeEntities(String(html[r])), relativeTo: base)?.absoluteString,
+                  !seen.contains(url) else { continue }
+            seen.insert(url)
+            docs.append(AgendaDoc(name: "Attachment", url: url, item: current))
+        }
+        return docs
+    }
+
+    /// Where a meeting's documents go: its own folder in the save folder,
+    /// "2026-11-05 Town of Tiburon - Design Review Board Special Meeting".
+    static func meetingFolder(_ meeting: AgendaMeeting, board: String, state: WatcherState) -> URL {
+        // Titles often repeat the date ("… - Nov 05, 2026", "…: November 9, 2026").
+        let title = meeting.title
+            .replacingOccurrences(of: #"[\s:,(-]*(?:\(|\b)(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}.*$"#,
+                                  with: "", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"[\s:,(-]*\d{1,2}/\d{1,2}/\d{4}.*$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        return outputDirectory(for: state).appendingPathComponent(
+            sanitizedBaseName("\(meeting.date) \(board) - \(title.isEmpty ? "Meeting" : title)"), isDirectory: true)
+    }
+
+    /// The agenda folder a newly arrived recording belongs in: the same
+    /// board's meeting on the date in the recording's title (or, without one,
+    /// the one that started most recently in the last two days), provided the
+    /// folder is still where HearYe made it.
+    static func agendaFolder(for title: String, channel: WatchedChannel, state: WatcherState) -> URL? {
+        let now = Date()
+        let mine = (state.agendas ?? [:]).values.filter {
+            $0.board == channel.title && FileManager.default.fileExists(atPath: $0.folder)
+        }
+        var candidates: [AgendaRecord]
+        if let date = isoDate(in: title) {
+            candidates = mine.filter { $0.date == date }
+        } else {
+            let from = dayStamp.string(from: now.addingTimeInterval(-2 * 86_400))
+            candidates = mine.filter { $0.date >= from && ($0.start ?? now) <= now.addingTimeInterval(3600) }
+        }
+        guard !candidates.isEmpty else { return nil }
+        // Two bodies the same day: the one whose name shares the most words.
+        let words = Set(title.lowercased().split { !$0.isLetter }.map(String.init).filter { $0.count > 3 })
+        let best = candidates.max { a, b in
+            let wa = Set(a.title.lowercased().split { !$0.isLetter }.map(String.init)).intersection(words).count
+            let wb = Set(b.title.lowercased().split { !$0.isLetter }.map(String.init)).intersection(words).count
+            return wa != wb ? wa < wb : (a.start ?? .distantPast) < (b.start ?? .distantPast)
+        }
+        return best.map { URL(fileURLWithPath: $0.folder, isDirectory: true) }
+    }
+
+    // MARK: Saving
+
+    /// Downloads one document into `folder`, named from the server's file
+    /// name when it gives a real one. Returns the saved file's name.
+    /// Downloads one document into `folder` as "<item> - <the file's own
+    /// name>": "CC-1 - Action_Minutes_October_15_2026.pdf", "Agenda - …",
+    /// "Packet - …". `added` marks a document found after the agenda was
+    /// first saved. Returns the saved file's name.
+    static func downloadDocument(_ doc: AgendaDoc, into folder: URL, added: String?) async -> String? {
+        guard let url = URL(string: doc.url) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 600)
+        request.setValue(downloaderUserAgent, forHTTPHeaderField: "User-Agent")
+        guard let (temp, response) = try? await URLSession.shared.download(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+        let mime = (http.mimeType ?? "").lowercased()
+        let served = (response.suggestedFilename ?? "").removingPercentEncoding ?? ""
+        let ext = mime.contains("pdf") ? "pdf" : mime.contains("html") ? "html"
+            : URL(fileURLWithPath: served).pathExtension.nilIfEmpty ?? "pdf"
+        // The file's own name, unless the server only gave a script's.
+        var original = (served as NSString).deletingPathExtension
+        let bare = original.replacingOccurrences(of: #"\.(php|aspx?)$"#, with: "", options: [.regularExpression, .caseInsensitive]).lowercased()
+        if bare.isEmpty || ["metaviewer", "historyattachment", "generatedagendaviewer", "agendaviewer", "meeting",
+                            "compileddocument", "download", "index", "unknown"].contains(bare) {
+            original = ""
+        }
+        let lower = doc.name.lowercased()
+        let label = doc.item ?? (lower.contains("packet") ? "Packet" : lower.contains("agenda") ? "Agenda"
+                                 : doc.name == "Attachment" ? "Other" : doc.name)
+        var base = original.isEmpty || label == original ? label : "\(label) - \(original)"
+        if let added { base += " (added \(added))" }
+        base = sanitizedBaseName(base)
+        let name = uniqueAudioBaseName(base, extension: ext, in: folder) + ".\(ext)"
+        do {
+            try FileManager.default.moveItem(at: temp, to: folder.appendingPathComponent(name))
+            return name
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: Agenda cycle
+
+    static func runAgendas(_ state: inout WatcherState) async -> [String] {
+        // HEARYE_NOW (ISO 8601) lets a test run stand at meeting time.
+        let now = ProcessInfo.processInfo.environment["HEARYE_NOW"].flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date()
+        let today = dayStamp.string(from: now)
+        let earliest = dayStamp.string(from: now.addingTimeInterval(-86_400))
+        let latest = dayStamp.string(from: now.addingTimeInterval(45 * 86_400))
+        var records = state.agendas ?? [:]
+        var lines: [String] = []
+
+        for channel in state.channels {
+            guard let source = agendaSource(for: channel) else { continue }
+            guard let listed = await fetchAgendaMeetings(source) else {
+                lines.append("\(channel.title) agendas: site unavailable")
+                continue
+            }
+            let readsPages = !(source.host ?? "").contains("primegov") && !(source.host ?? "").contains("legistar")
+            var posted = 0, added = 0
+            for var meeting in listed where meeting.date >= earliest && meeting.date <= latest {
+                let record = records[meeting.key]
+                // The meeting-time read: from half an hour before the start to
+                // a day after (all day, when no start time is known).
+                func recheckDue(_ start: Date?) -> Bool {
+                    if let start { return now >= start.addingTimeInterval(-30 * 60) && now < start.addingTimeInterval(86_400) }
+                    return meeting.date == today
+                }
+                let due = record.map { !$0.rechecked && recheckDue(meeting.start ?? $0.start) } ?? false
+                // Only a new agenda or the meeting-time read opens the page,
+                // except where the page is the only document list there is.
+                if record == nil ? (readsPages || !meeting.docs.isEmpty) : (due || readsPages) {
+                    meeting = await withPageDocuments(meeting)
+                }
+                if record == nil, meeting.docs.isEmpty { continue }  // nothing posted yet
+
+                let folder = meetingFolder(meeting, board: channel.title, state: state)
+                var r = record ?? AgendaRecord(board: channel.title, title: meeting.title, start: meeting.start,
+                                               folder: folder.path, saved: [], date: meeting.date)
+                let have = Set(r.saved)
+                let fresh = meeting.docs.filter { !have.contains($0.url) }
+                if !fresh.isEmpty {
+                    try? FileManager.default.createDirectory(at: URL(fileURLWithPath: r.folder), withIntermediateDirectories: true)
+                    let addedNote = record == nil ? nil : addedStamp.string(from: now)
+                    var got: [String] = []
+                    writeProgress(WatcherProgress(phase: "checking", channel: channel.title, title: meeting.title))
+                    for doc in fresh {
+                        if let name = await downloadDocument(doc, into: URL(fileURLWithPath: r.folder), added: addedNote) {
+                            r.saved.append(doc.url)
+                            got.append(name)
+                        }
+                    }
+                    if record == nil, got.isEmpty { continue }  // try again next cycle
+                    r.files += got
+                    let where_ = displayPath(URL(fileURLWithPath: r.folder))
+                    if record == nil {
+                        posted += 1
+                        await alert(title: "\(channel.title) agenda posted",
+                                    body: "\(meeting.title): \(got.count == 1 ? "the agenda is" : "the agenda\(meeting.hasPacket ? ", full packet" : "") and all \(got.count) documents are") in \(where_).")
+                    } else if !got.isEmpty {
+                        added += got.count
+                        await alert(title: "\(got.count) new document\(got.count == 1 ? "" : "s") for \(channel.title)",
+                                    body: "\(meeting.title): \(got.joined(separator: ", ")) — in \(where_).")
+                    }
+                }
+                r.start = meeting.start ?? r.start
+                // Seen for the first time at or after its start: this read
+                // is the meeting-time read.
+                if due || (record == nil && recheckDue(r.start) && (r.start.map { now >= $0.addingTimeInterval(-30 * 60) } ?? true)) {
+                    r.rechecked = true
+                }
+                records[meeting.key] = r
+            }
+            if posted + added > 0 {
+                lines.append("\(channel.title) agendas: \(posted) posted, \(added) late documents")
+            }
+        }
+
+        let cutoff = dayStamp.string(from: now.addingTimeInterval(-30 * 86_400))
+        state.agendas = records.filter { $0.value.date >= cutoff }
+        return lines
     }
 }

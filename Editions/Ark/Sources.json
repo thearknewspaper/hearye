@@ -2,12 +2,14 @@
   {
     "url": "https://www.youtube.com/@townoftiburon1964/videos",
     "channelId": "UCm1Qh2lMsMcvDt3QiXKrf6g",
-    "title": "Town of Tiburon"
+    "title": "Town of Tiburon",
+    "agendaURL": "https://townoftiburon.granicus.com/ViewPublisher.php?view_id=5"
   },
   {
     "url": "https://www.youtube.com/@CityofBelvedere/videos",
     "channelId": "UCSSPUdGTgxXb_v6Im5q0lEA",
-    "title": "City of Belvedere"
+    "title": "City of Belvedere",
+    "agendaURL": "https://cityofbelvedere.gov/meetings/"
   },
   {
     "url": "https://www.reedschools.org/school-board/meeting-recordings",
@@ -20,6 +22,7 @@
     "channelId": "podcast:marin-bos",
     "title": "Marin County Board of Supervisors",
     "kind": "podcast",
-    "feedURL": "https://marin.granicus.com/Podcast.php?view_id=33"
+    "feedURL": "https://marin.granicus.com/Podcast.php?view_id=33",
+    "agendaURL": "https://portal-marincounty.primegov.com/?committeeId=1"
   }
 ]

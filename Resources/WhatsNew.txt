@@ -1,3 +1,5 @@
+• Agendas and full packets: each watched meeting gets its own folder, with every document named for its agenda item, saved as soon as the agenda is posted. At meeting time HearYe checks again for late mail and other additions, and the recording's audio joins the same folder.
+• Watches PrimeGov's newer "OneMeeting" portals, such as Marin County's.
 • Watch the meeting systems cities and school districts actually use: Swagit, Legistar, PrimeGov, CivicClerk, BoardDocs, ProudCity city sites and Cablecast pages, alongside Granicus and YouTube. Paste the system's public page and HearYe finds the recordings.
 • Granicus and Swagit player pages now download directly.
 • When a page can't be watched, HearYe says why and what to paste instead.
