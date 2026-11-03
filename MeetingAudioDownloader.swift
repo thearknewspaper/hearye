@@ -3553,6 +3553,13 @@ extension MeetingWatcher {
                   let url = URL(string: decodeEntities(String(html[r])), relativeTo: base)?.absoluteString,
                   !seen.contains(url) else { continue }
             seen.insert(url)
+            // A file named as the agenda or packet is that, wherever it sits
+            // on the page; a stray number above it is not its item.
+            let file = (URL(string: url)?.lastPathComponent ?? "").lowercased()
+            if (file.contains("agenda") || file.contains("packet")) && !file.contains("item") {
+                docs.append(AgendaDoc(name: file.contains("packet") ? "Packet" : "Agenda", url: url, item: nil))
+                continue
+            }
             docs.append(AgendaDoc(name: "Attachment", url: url, item: current))
         }
         return docs
