@@ -1125,6 +1125,8 @@ private struct WatchedChannel: Codable, Identifiable, Equatable {
     /// a PrimeGov, Granicus, Legistar or WordPress-meetings site. nil = work
     /// it out from the recordings source, if that platform carries agendas.
     var agendaURL: String? = nil
+    /// The boards followed at this source; nil = all of them.
+    var boards: [String]? = nil
 
     var sourceKind: String { kind ?? "youtube" }
 
@@ -1441,6 +1443,11 @@ private enum MeetingWatcher {
                     return nil
                 }
             }
+        }
+        // A city page that frames its Granicus archive.
+        if !host.hasSuffix(".granicus.com"), let html = await fetchText(trimmed),
+           let frame = matches(#"([a-z0-9-]+\.granicus\.com/ViewPublisher\.php\?view_id=\d+)"#, in: html).first {
+            return await resolveSource("https://\(frame)")
         }
         if let platform = await resolvePlatform(url: url, host: host, input: trimmed) {
             return platform
@@ -1959,6 +1966,12 @@ private enum MeetingWatcher {
                 continue
             }
 
+            // A board that isn't followed is passed over for good, so
+            // following it later starts from then, not from its backlog.
+            if !channel.isYouTube {
+                let known = Set(seenIDs)
+                seenIDs += entries.filter { !known.contains($0.id) && !follows(channel, title: $0.title) }.map(\.id)
+            }
             let seenSet = Set(seenIDs)
             let fresh = entries.filter { !seenSet.contains($0.id) }.reversed()  // oldest first
             var savedCount = 0
@@ -2130,6 +2143,7 @@ private final class WatcherModel: ObservableObject {
 
     @Published private(set) var state: WatcherState
     @Published var newChannelText = ""
+    @Published var boardChoice: BoardChoice?
 
     init() {
         var loaded = MeetingWatcher.loadState()
@@ -2218,8 +2232,8 @@ private final class WatcherModel: ObservableObject {
         noticeText = nil
         Task {
             let resolved = await MeetingWatcher.resolveSource(input)
-            self.isResolving = false
             guard let resolved else {
+                self.isResolving = false
                 if let hint = MeetingWatcher.lastResolveHint {
                     self.notice(hint, isError: true)
                     return
@@ -2228,14 +2242,58 @@ private final class WatcherModel: ObservableObject {
                 return
             }
             guard !self.state.channels.contains(where: { $0.channelId == resolved.channelId }) else {
+                self.isResolving = false
                 self.notice("\(resolved.title) is already being watched.", isError: false)
                 return
             }
-            self.state.channels.append(resolved)
+            let boards = await MeetingWatcher.detectBoards(resolved)
+            self.isResolving = false
             self.newChannelText = ""
-            self.persist()
-            self.notice("Watching \(resolved.title). Existing videos stay put; only meetings posted from now on are fetched.", isError: false)
+            if boards.count > 1 {
+                self.boardChoice = BoardChoice(channel: resolved, boards: boards, picked: Set(boards), isNew: true)
+                return
+            }
+            self.startWatching(resolved)
         }
+    }
+
+    private func startWatching(_ channel: WatchedChannel) {
+        state.channels.append(channel)
+        persist()
+        notice("Watching \(channel.title). Existing videos stay put; only meetings posted from now on are fetched.", isError: false)
+    }
+
+    /// Opens the board list for a source already being watched.
+    func chooseBoards(_ channel: WatchedChannel) {
+        guard !isResolving else { return }
+        isResolving = true
+        Task {
+            var boards = await MeetingWatcher.detectBoards(channel)
+            boards += (channel.boards ?? []).filter { !boards.contains($0) }
+            self.isResolving = false
+            guard boards.count > 1 else {
+                self.notice("HearYe found only one board at \(channel.title).", isError: false)
+                return
+            }
+            self.boardChoice = BoardChoice(channel: channel, boards: boards, picked: Set(channel.boards ?? boards), isNew: false)
+        }
+    }
+
+    func applyBoards(_ choice: BoardChoice) {
+        var channel = choice.channel
+        // Every box ticked means all, including boards that appear later.
+        channel.boards = choice.picked.count == choice.boards.count ? nil : choice.boards.filter(choice.picked.contains)
+        boardChoice = nil
+        if choice.isNew {
+            startWatching(channel)
+        } else if let index = state.channels.firstIndex(where: { $0.channelId == channel.channelId }) {
+            state.channels[index] = channel
+            persist()
+        }
+    }
+
+    func canChooseBoards(_ channel: WatchedChannel) -> Bool {
+        !channel.isYouTube || MeetingWatcher.agendaSource(for: channel) != nil
     }
 
     /// Check the ticked channels right now, watching on or off. The work runs
@@ -2446,6 +2504,11 @@ private struct WatcherSectionView: View {
                                 Text(preset.title).font(.subheadline)
                             }
                             Spacer(minLength: 0)
+                            if let watched = model.state.channels.first(where: { $0.channelId == preset.channelId }), model.canChooseBoards(watched) {
+                                Button(watched.boards.map { "\($0.count) board\($0.count == 1 ? "" : "s")…" } ?? "Boards…") { model.chooseBoards(watched) }
+                                    .controlSize(.small)
+                                    .disabled(model.isResolving)
+                            }
                         }
                     }
                 }
@@ -2462,6 +2525,11 @@ private struct WatcherSectionView: View {
                             Text(channel.title).font(.subheadline)
                         }
                         Spacer()
+                        if model.canChooseBoards(channel) {
+                            Button(channel.boards.map { "\($0.count) board\($0.count == 1 ? "" : "s")…" } ?? "Boards…") { model.chooseBoards(channel) }
+                                .controlSize(.small)
+                                .disabled(model.isResolving)
+                        }
                         Button("Remove") { model.removeChannel(channel) }
                             .controlSize(.small)
                     }
@@ -2477,6 +2545,9 @@ private struct WatcherSectionView: View {
                     }
                     Button("Add") { model.addChannel() }
                         .disabled(model.isResolving || model.newChannelText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .sheet(item: $model.boardChoice) { choice in
+                            BoardPicker(choice: choice, onDone: { model.applyBoards($0) }, onCancel: { model.boardChoice = nil })
+                        }
                 }
                 Text("For example a channel's Videos page (https://www.youtube.com/@ChannelName/videos), a playlist for one board on a shared channel (https://www.youtube.com/playlist?list=…), a Granicus archive (https://city.granicus.com/ViewPublisher.php?view_id=2), or a school board's recordings page.")
                     .font(.caption)
@@ -2550,6 +2621,56 @@ private struct WatcherSectionView: View {
             }
             .padding(4)
         }
+    }
+}
+
+/// The boards found at a source, and which of them to follow.
+private struct BoardChoice: Identifiable {
+    let channel: WatchedChannel
+    let boards: [String]
+    var picked: Set<String>
+    let isNew: Bool
+    var id: String { channel.channelId }
+}
+
+private struct BoardPicker: View {
+    @State var choice: BoardChoice
+    let onDone: (BoardChoice) -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Boards at \(choice.channel.title)").font(.headline)
+            Text("Pick the boards to follow. HearYe found these in the source's recent meetings; a board that hasn't met lately may not be listed.")
+                .font(.caption).foregroundStyle(.secondary)
+            if choice.channel.isYouTube {
+                Text("This applies to agendas. YouTube recordings are still all saved.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("All") { choice.picked = Set(choice.boards) }
+                Button("None") { choice.picked = [] }
+            }.controlSize(.small)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(choice.boards, id: \.self) { board in
+                        Toggle(board, isOn: Binding(
+                            get: { choice.picked.contains(board) },
+                            set: { on in if on { choice.picked.insert(board) } else { choice.picked.remove(board) } }))
+                            .toggleStyle(.checkbox)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(maxHeight: 320)
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { onCancel() }.keyboardShortcut(.cancelAction)
+                Button(choice.isNew ? "Watch" : "Save") { onDone(choice) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(choice.picked.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
     }
 }
 
@@ -2970,6 +3091,81 @@ extension MeetingWatcher {
         return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
             $0.numberOfRanges > 1 ? Range($0.range(at: 1), in: text).map { String(text[$0]) } : nil
         }
+    }
+
+    /// The board a meeting belongs to, from its title: "Planning Commission
+    /// Meeting- CANCELLED - Nov 11, 2026" -> "Planning Commission".
+    static func boardName(_ title: String) -> String {
+        var t = decodeEntities(title)
+        for (pattern, replacement) in [
+            (#"(?i)[-–:]?\s*\b(cancell?ed|postponed)\b"#, ""),
+            (#"(?i)[-–:,]?\s*\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}.*$"#, ""),
+            (#"[-–:,]?\s*\b\d{1,2}/\d{1,2}/\d{2,4}.*$"#, ""),
+            (#"(?i)\bemergency\s+(meeting|mtg)\b"#, ""),
+            (#"(?i)\b(regular|special|adjourned|meeting|mtg)\b"#, ""),
+            (#"\s+"#, " "),
+        ] {
+            t = t.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
+        }
+        return t.trimmingCharacters(in: CharacterSet(charactersIn: " -–:,"))
+    }
+
+    /// Spelling-proof form for comparing boards: "Parks, Open Spaces, and
+    /// Lanes" and "Parks, Open Spaces and Lanes" are one board.
+    static func boardKey(_ name: String) -> String {
+        name.lowercased().replacingOccurrences(of: "&", with: "and")
+            .replacingOccurrences(of: #"\(.*?\)"#, with: " ", options: .regularExpression)
+            .filter { $0.isLetter || $0.isNumber || $0 == " " }
+            .split(separator: " ").joined(separator: " ")
+    }
+
+    /// Whether a meeting is one the journalist follows. "Contains", so a joint
+    /// Town Council/Planning Commission meeting counts for both boards.
+    static func follows(_ channel: WatchedChannel, title: String) -> Bool {
+        guard let boards = channel.boards else { return true }
+        let key = boardKey(boardName(title))
+        return key.isEmpty || boards.contains { key.contains(boardKey($0)) }
+    }
+
+    /// A Granicus archive's own sections, one per board, whether or not the
+    /// board has met lately.
+    static func granicusBoards(_ channel: WatchedChannel) async -> [String] {
+        guard let page = agendaSource(for: channel), page.host?.hasSuffix(".granicus.com") == true,
+              let html = await fetchText(page.absoluteString, timeout: 120) else { return [] }
+        var seen = Set<String>()
+        return matches(#"class="CollapsiblePanelTab"[^>]*>\s*([^<]+?)\s*</div>"#, in: html)
+            .map { decodeEntities($0.replacingOccurrences(of: "\\", with: "")) }
+            .filter { seen.insert(boardKey($0)).inserted }
+    }
+
+    /// The boards at a source: the site's own list where it has one, then any
+    /// others in its recent recordings and agendas, busiest first.
+    static func detectBoards(_ channel: WatchedChannel) async -> [String] {
+        var titles: [String] = []
+        switch channel.sourceKind {
+        case "podcast": titles += (await fetchPodcastEntries(feedURL: channel.feedURL ?? channel.url) ?? []).map(\.title)
+        case "webpage": titles += (await fetchWebpageEntries(pageURL: channel.url) ?? []).map(\.title)
+        case "swagit", "primegov", "civicclerk", "legistar", "boarddocs", "proudcity":
+            titles += (await fetchPlatformEntries(channel) ?? []).map(\.title)
+        default: break
+        }
+        if let source = agendaSource(for: channel) {
+            titles += (await fetchAgendaMeetings(source) ?? []).map(\.title)
+        }
+        // Each board under its most used spelling.
+        var spellings: [String: [String: Int]] = [:]
+        for name in titles.map(boardName) where name.count > 2 {
+            spellings[boardKey(name), default: [:]][name, default: 0] += 1
+        }
+        let counts = spellings.mapValues { $0.values.reduce(0, +) }
+        // "Town Council (Caltrans Forum)" is a Town Council meeting.
+        let keys = counts.keys.filter { key in !counts.keys.contains { $0 != key && key.contains($0) } }
+        let found = keys.sorted { (counts[$0]!, $1) > (counts[$1]!, $0) }.compactMap { key in
+            spellings[key]?.max { $0.value < $1.value }?.key
+        }
+        let listed = await granicusBoards(channel)
+        let listedKeys = listed.map(boardKey)
+        return listed + found.filter { name in !listedKeys.contains { boardKey(name).contains($0) } }
     }
 
     /// "okc.primegov.com" -> "Okc"; good enough for a default name.
@@ -3754,7 +3950,7 @@ extension MeetingWatcher {
             }
             let readsPages = !(source.host ?? "").contains("primegov") && !(source.host ?? "").contains("legistar")
             var posted = 0, added = 0
-            for var meeting in listed where meeting.date >= earliest && meeting.date <= latest {
+            for var meeting in listed where meeting.date >= earliest && meeting.date <= latest && follows(channel, title: meeting.title) {
                 let record = records[meeting.key]
                 // The meeting-time read: from half an hour before the start to
                 // a day after (all day, when no start time is known).
