@@ -1127,6 +1127,9 @@ private struct WatchedChannel: Codable, Identifiable, Equatable {
     var agendaURL: String? = nil
     /// The boards followed at this source; nil = all of them.
     var boards: [String]? = nil
+    /// Every board offered when those were picked, ticked or not, so a board
+    /// that turns up later can be told apart.
+    var knownBoards: [String]? = nil
 
     var sourceKind: String { kind ?? "youtube" }
 
@@ -1969,6 +1972,13 @@ private enum MeetingWatcher {
             // A board that isn't followed is passed over for good, so
             // following it later starts from then, not from its backlog.
             if !channel.isYouTube {
+                if let index = state.channels.firstIndex(where: { $0.channelId == channel.channelId }) {
+                    let fresh = newBoards(&state.channels[index], titles: entries.map(\.title))
+                    if !fresh.isEmpty {
+                        await alert(title: "New board at \(channel.title)",
+                                    body: "\(fresh.joined(separator: ", ")) isn't being followed. Click Boards… beside \(channel.title) in HearYe to add it.")
+                    }
+                }
                 let known = Set(seenIDs)
                 seenIDs += entries.filter { !known.contains($0.id) && !follows(channel, title: $0.title) }.map(\.id)
             }
@@ -2283,6 +2293,7 @@ private final class WatcherModel: ObservableObject {
         var channel = choice.channel
         // Every box ticked means all, including boards that appear later.
         channel.boards = choice.picked.count == choice.boards.count ? nil : choice.boards.filter(choice.picked.contains)
+        channel.knownBoards = choice.boards
         boardChoice = nil
         if choice.isNew {
             startWatching(channel)
@@ -2641,7 +2652,7 @@ private struct BoardPicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Boards at \(choice.channel.title)").font(.headline)
-            Text("Pick the boards to follow. HearYe found these in the source's recent meetings; a board that hasn't met lately may not be listed.")
+            Text("Pick the boards to follow. A board that hasn't met lately may not be listed; if a new one appears, HearYe alerts you and leaves it off until you tick it.")
                 .font(.caption).foregroundStyle(.secondary)
             if choice.channel.isYouTube {
                 Text("This applies to agendas. YouTube recordings are still all saved.")
@@ -3125,6 +3136,23 @@ extension MeetingWatcher {
         guard let boards = channel.boards else { return true }
         let key = boardKey(boardName(title))
         return key.isEmpty || boards.contains { key.contains(boardKey($0)) }
+    }
+
+    /// Boards in `titles` the journalist has never been offered, for a source
+    /// followed selectively. Each is added to `knownBoards`, so it's told once.
+    static func newBoards(_ channel: inout WatchedChannel, titles: [String]) -> [String] {
+        guard channel.boards != nil else { return [] }
+        var known = (channel.knownBoards ?? channel.boards ?? []).map(boardKey)
+        var fresh: [String] = []
+        for name in titles.map(boardName) where name.count > 2 {
+            let key = boardKey(name)
+            if !known.contains(where: { key.contains($0) }) {
+                known.append(key)
+                fresh.append(name)
+            }
+        }
+        channel.knownBoards = (channel.knownBoards ?? channel.boards ?? []) + fresh
+        return fresh
     }
 
     /// A Granicus archive's own sections, one per board, whether or not the
@@ -3947,6 +3975,13 @@ extension MeetingWatcher {
             guard let listed = await fetchAgendaMeetings(source) else {
                 lines.append("\(channel.title) agendas: site unavailable")
                 continue
+            }
+            if let index = state.channels.firstIndex(where: { $0.channelId == channel.channelId }) {
+                let fresh = newBoards(&state.channels[index], titles: listed.map(\.title))
+                if !fresh.isEmpty {
+                    await alert(title: "New board at \(channel.title)",
+                                body: "\(fresh.joined(separator: ", ")) isn't being followed. Click Boards… beside \(channel.title) in HearYe to add it.")
+                }
             }
             let readsPages = !(source.host ?? "").contains("primegov") && !(source.host ?? "").contains("legistar")
             var posted = 0, added = 0
