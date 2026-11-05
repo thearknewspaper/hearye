@@ -1449,7 +1449,7 @@ private enum MeetingWatcher {
             // Recordings elsewhere (Tiburon's are on YouTube), agendas here.
             if let meetings = await granicusAgendas(host: host, view: viewID), !meetings.isEmpty {
                 let site = (await feedTitle(feed))?.components(separatedBy: ":").first ?? host
-                return WatchedChannel(url: trimmed, channelId: "agendas:\(host):\(viewID)", title: "\(site) agendas", kind: "agendas",
+                return WatchedChannel(url: trimmed, channelId: "agendas:\(host):\(viewID)", title: site, kind: "agendas",
                                       agendaURL: "https://\(host)/ViewPublisher.php?view_id=\(viewID)")
             }
         }
