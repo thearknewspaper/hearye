@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 V=2.3.2
 ID="Developer ID Application: AMMI Publishing Company, Inc. (N89MRDWFVD)"
 check() { T=$(mktemp -d); ditto -x -k "$1" "$T"; spctl -a "$T/HearYe.app"; rm -rf "$T"; }
+ARK=dist/HearYe-$V-macOS-arm64.zip; check "$ARK"
 echo "== Public edition"
 EDITION=public ./build_release.sh arm64
 EDITION=public ./sign_and_notarize.sh "$ID" hearye-notary arm64
