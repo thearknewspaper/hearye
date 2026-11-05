@@ -1,3 +1,6 @@
+• The main window now shows your version and edition, with a link to check for updates.
+
+From 2.4:
 • Pick your boards: paste a city's meetings page and HearYe lists its boards, including ones with nothing posted lately. Follow only the ones you want, and change them any time with Boards… beside the source. If a new board appears, HearYe alerts you and leaves it off until you tick it.
 • Paste a city page that embeds its Granicus archive, or an archive with agendas but no recordings.
 

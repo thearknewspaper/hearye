@@ -2907,6 +2907,7 @@ private struct ContentView: View {
                     .font(.system(size: 26, weight: .bold))
                 Text("Public meetings, preserved.")
                     .foregroundStyle(.secondary)
+                AppVersionLine()
             }
             Spacer()
             Image(systemName: "waveform.and.mic")

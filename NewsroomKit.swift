@@ -466,6 +466,49 @@ struct UpdateStatusRow: View {
     }
 }
 
+/// One quiet line for the top of the main window: version, edition and the
+/// update check, without opening About.
+struct AppVersionLine: View {
+    @ObservedObject private var updates = UpdateChecker.shared
+
+    private func link(_ title: String, _ action: @escaping () -> Void) -> some View {
+        Button(title, action: action).buttonStyle(.link)
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Version \(AppIdentity.version) · \(AppIdentity.editionLabel)")
+            if AppIdentity.updateFeed != nil {
+                Text("·")
+                switch updates.state {
+                case .checking:
+                    ProgressView().controlSize(.mini)
+                    Text("Checking…")
+                case .available(let v, let page):
+                    Text("\(v) is available.")
+                    link("Download…") { NSWorkspace.shared.open(page) }
+                case .downloading(let v):
+                    ProgressView().controlSize(.mini)
+                    Text("Downloading \(v)…")
+                case .ready(let v):
+                    Text("\(v) is ready.")
+                    link("Install and Relaunch") { updates.install(relaunch: true) }
+                case .current:
+                    Text("Up to date.")
+                    link("Check Again") { Task { await updates.check() } }
+                case .failed(let msg):
+                    Text("Couldn't check.").help(msg)
+                    link("Try Again") { Task { await updates.check() } }
+                case .idle:
+                    link("Check for Updates") { Task { await updates.check() } }
+                }
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+    }
+}
+
 // MARK: - What's New
 
 /// Shown once after each update, from the bundled WhatsNew.txt. Not on a
