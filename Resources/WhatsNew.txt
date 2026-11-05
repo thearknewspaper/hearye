@@ -1,3 +1,7 @@
+• Pick your boards: paste a city's meetings page and HearYe lists its boards, including ones with nothing posted lately. Follow only the ones you want, and change them any time with Boards… beside the source. If a new board appears, HearYe alerts you and leaves it off until you tick it.
+• Paste a city page that embeds its Granicus archive, or an archive with agendas but no recordings.
+
+From 2.3.2:
 • Follows the links inside agenda PDFs, including Adobe Acrobat share links, so Belvedere's staff reports and minutes are saved with the agenda under their item numbers.
 • Finds Granicus meetings listed under Upcoming Events but left out of the agenda feed, such as Tiburon's Town Council.
 • Agendas uploaded as PDFs are saved as PDFs, and agenda files are no longer labeled with a stray number.

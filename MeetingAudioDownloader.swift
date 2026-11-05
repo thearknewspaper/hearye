@@ -1446,6 +1446,12 @@ private enum MeetingWatcher {
                     return nil
                 }
             }
+            // Recordings elsewhere (Tiburon's are on YouTube), agendas here.
+            if let meetings = await granicusAgendas(host: host, view: viewID), !meetings.isEmpty {
+                let site = (await feedTitle(feed))?.components(separatedBy: ":").first ?? host
+                return WatchedChannel(url: trimmed, channelId: "agendas:\(host):\(viewID)", title: "\(site) agendas", kind: "agendas",
+                                      agendaURL: "https://\(host)/ViewPublisher.php?view_id=\(viewID)")
+            }
         }
         // A city page that frames its Granicus archive.
         if !host.hasSuffix(".granicus.com"), let html = await fetchText(trimmed),
@@ -1947,6 +1953,8 @@ private enum MeetingWatcher {
                 fetched = await fetchPlatformEntries(channel)
             case "playlist":
                 fetched = fetchPlaylistEntries(url: channel.url)
+            case "agendas":
+                continue
             default:
                 fetched = await fetchFeedVideoIDs(channelId: channel.channelId)
                 if fetched == nil {
@@ -2270,7 +2278,9 @@ private final class WatcherModel: ObservableObject {
     private func startWatching(_ channel: WatchedChannel) {
         state.channels.append(channel)
         persist()
-        notice("Watching \(channel.title). Existing videos stay put; only meetings posted from now on are fetched.", isError: false)
+        notice(channel.sourceKind == "agendas"
+               ? "Watching \(channel.title). This archive has agendas but no recordings; add the body's YouTube channel for audio."
+               : "Watching \(channel.title). Existing videos stay put; only meetings posted from now on are fetched.", isError: false)
     }
 
     /// Opens the board list for a source already being watched.
@@ -2466,7 +2476,7 @@ private struct WatcherSectionView: View {
         case "playlist": return "list.and.film"
         case "podcast": return "dot.radiowaves.up.forward"
         case "webpage": return "doc.richtext"
-        case "swagit", "primegov", "civicclerk", "legistar", "boarddocs", "proudcity": return "building.columns"
+        case "swagit", "primegov", "civicclerk", "legistar", "boarddocs", "proudcity", "agendas": return "building.columns"
         default: return "dot.radiowaves.left.and.right"
         }
     }
@@ -2481,6 +2491,7 @@ private struct WatcherSectionView: View {
         case "civicclerk": return "CivicClerk portal"
         case "boarddocs": return "BoardDocs"
         case "proudcity": return "ProudCity site"
+        case "agendas": return "Agendas only"
         case "legistar": return "Legistar calendar"
         default: return "Channel"
         }
@@ -2977,6 +2988,9 @@ private enum HearYeMain {
            CommandLine.arguments.count > index + 1 {
             if let source = await MeetingWatcher.resolveSource(CommandLine.arguments[index + 1]) {
                 print("\(source.sourceKind)\t\(source.title)\t\(source.channelId)\t\(source.feedURL ?? "")")
+                if CommandLine.arguments.contains("--boards") {
+                    for board in await MeetingWatcher.detectBoards(source) { print("  \(board)") }
+                }
                 // With --entries, also list what the watcher would see.
                 if CommandLine.arguments.contains("--entries") {
                     var entries: [WatcherEntry]?
@@ -3112,13 +3126,17 @@ extension MeetingWatcher {
             (#"(?i)[-–:]?\s*\b(cancell?ed|postponed)\b"#, ""),
             (#"(?i)[-–:,]?\s*\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}.*$"#, ""),
             (#"[-–:,]?\s*\b\d{1,2}/\d{1,2}/\d{2,4}.*$"#, ""),
+            (#"[-–:,]?\s*\b(\d{4}-\d{2}-\d{2}|\d{1,2}-\d{1,2}-\d{4}).*$"#, ""),
+            (#"[-–:,]?\s*\b\d{6}\b.*$"#, ""),
+            (#"^[\s*•]+"#, ""),
+            (#"(?i)^(hybrid|remote|virtual|in[- ]person)\s+"#, ""),
             (#"(?i)\bemergency\s+(meeting|mtg)\b"#, ""),
             (#"(?i)\b(regular|special|adjourned|meeting|mtg)\b"#, ""),
             (#"\s+"#, " "),
         ] {
             t = t.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
         }
-        return t.trimmingCharacters(in: CharacterSet(charactersIn: " -–:,"))
+        return t.trimmingCharacters(in: CharacterSet(charactersIn: " -–:,*"))
     }
 
     /// Spelling-proof form for comparing boards: "Parks, Open Spaces, and
@@ -3161,9 +3179,11 @@ extension MeetingWatcher {
         guard let page = agendaSource(for: channel), page.host?.hasSuffix(".granicus.com") == true,
               let html = await fetchText(page.absoluteString, timeout: 120) else { return [] }
         var seen = Set<String>()
-        return matches(#"class="CollapsiblePanelTab"[^>]*>\s*([^<]+?)\s*</div>"#, in: html)
+        let sections = matches(#"class="CollapsiblePanelTab"[^>]*>\s*([^<]+?)\s*</div>"#, in: html)
             .map { decodeEntities($0.replacingOccurrences(of: "\\", with: "")) }
             .filter { seen.insert(boardKey($0)).inserted }
+        // Sections by year (Marin's) aren't boards.
+        return sections.contains { $0.range(of: #"^\d{4}$"#, options: .regularExpression) != nil } ? [] : sections
     }
 
     /// The boards at a source: the site's own list where it has one, then any
