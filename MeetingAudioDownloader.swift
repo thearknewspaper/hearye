@@ -3467,7 +3467,9 @@ extension MeetingWatcher {
             return AgendaMeeting(key: "granicus:\(host):\(event)", title: title, date: date, start: nil, page: link,
                                  docs: [AgendaDoc(name: "Agenda", url: link)])
         }
-        let known = Set(listed.map(\.key))
+        // Only events: clip and event numbers are separate series, so an old
+        // recording can share a number with an upcoming meeting.
+        let known = Set(listed.filter { $0.page?.contains("event_id=") == true }.map(\.key))
         return listed + (await granicusUpcoming(host: host, view: view)).filter { !known.contains($0.key) }
     }
 
