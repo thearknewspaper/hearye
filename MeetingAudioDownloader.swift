@@ -3718,7 +3718,10 @@ extension MeetingWatcher {
             original = ""
         }
         let lower = doc.name.lowercased()
-        let label = doc.item ?? (lower.contains("packet") ? "Packet" : lower.contains("agenda") ? "Agenda"
+        // An attachment outside any item may still be the agenda's own PDF
+        // ("PDF_Agenda.pdf" on Granicus), which only its file name tells.
+        let named = doc.name == "Attachment" ? original.lowercased() : lower
+        let label = doc.item ?? (named.contains("packet") ? "Packet" : named.contains("agenda") ? "Agenda"
                                  : doc.name == "Attachment" ? "Other" : doc.name)
         var base = original.isEmpty || label == original ? label : "\(label) - \(original)"
         if let added { base += " (added \(added))" }
