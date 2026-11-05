@@ -26,10 +26,4 @@ gh release create v$V "$PUB" "dist/HearYe-Public-$V-macOS-arm64.sha256" \
   /private/tmp/hearye-gpl-src/HearYe-$V-third-party-sources.tar.gz --repo thearknewspaper/hearye \
   --title "HearYe $V" --notes-file <(sed '/^From 2.4:/,$d' Resources/WhatsNew.txt)
 
-echo "== Installing the Ark edition in /Applications"
-osascript -e 'tell application id "com.kevin.hearye" to quit' 2>/dev/null || true
-sleep 3
-T=$(mktemp -d); ditto -x -k "$ARK" "$T"
-rm -rf /Applications/HearYe.app && ditto "$T/HearYe.app" /Applications/HearYe.app; rm -rf "$T"
-open /Applications/HearYe.app   # re-points the background watcher at this copy
-echo "Released and installed HearYe $V"
+echo "Released HearYe $V. Not installed here: the running 2.4 should update itself."
