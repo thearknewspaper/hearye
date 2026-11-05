@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Foundation
+import PDFKit
 import UniformTypeIdentifiers
 import UserNotifications
 import os
@@ -3458,13 +3459,34 @@ extension MeetingWatcher {
     /// attachments (MetaViewer.php) and says when the meeting starts.
     static func granicusAgendas(host: String, view: String) async -> [AgendaMeeting]? {
         guard let xml = await fetchText("https://\(host)/ViewPublisherRSS.php?view_id=\(view)&mode=agendas") else { return nil }
-        return xml.components(separatedBy: "<item>").dropFirst().compactMap { item -> AgendaMeeting? in
+        let listed = xml.components(separatedBy: "<item>").dropFirst().compactMap { item -> AgendaMeeting? in
             guard let title = matches(#"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>"#, in: item).first.map(decodeEntities),
                   let link = matches(#"<link>(.*?)</link>"#, in: item).first.map(decodeEntities),
                   let date = isoDate(in: title), !title.lowercased().contains("cancel") else { return nil }
             let event = matches(#"(?:event_id|clip_id)=(\d+)"#, in: link).first ?? link
             return AgendaMeeting(key: "granicus:\(host):\(event)", title: title, date: date, start: nil, page: link,
                                  docs: [AgendaDoc(name: "Agenda", url: link)])
+        }
+        let known = Set(listed.map(\.key))
+        return listed + (await granicusUpcoming(host: host, view: view)).filter { !known.contains($0.key) }
+    }
+
+    /// The Upcoming Events table on the view's page. The feed can leave out
+    /// meetings the table has: Tiburon's listed the Design Review Board but
+    /// not the Town Council the same week.
+    static func granicusUpcoming(host: String, view: String) async -> [AgendaMeeting] {
+        guard let html = await fetchText("https://\(host)/ViewPublisher.php?view_id=\(view)", timeout: 120) else { return [] }
+        return html.components(separatedBy: "<tr").dropFirst().compactMap { row -> AgendaMeeting? in
+            guard row.contains("listingRow"), let event = matches(#"AgendaViewer\.php\?[^"']*event_id=(\d+)"#, in: row).first else { return nil }
+            let cells = matches(#"(?s)<td[^>]*>(.*?)</td>"#, in: row).map {
+                decodeEntities($0.replacingOccurrences(of: "&nbsp;", with: " ")
+                    .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+                    .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression))
+            }
+            guard cells.count >= 2, let date = isoDate(in: cells[1]), !cells[0].lowercased().contains("cancel") else { return nil }
+            let link = "https://\(host)/AgendaViewer.php?view_id=\(view)&event_id=\(event)"
+            return AgendaMeeting(key: "granicus:\(host):\(event)", title: "\(cells[0]) - \(cells[1].components(separatedBy: " - ")[0])", date: date,
+                                 start: startTime(in: cells[1], date: date), page: link, docs: [AgendaDoc(name: "Agenda", url: link)])
         }
     }
 
@@ -3515,7 +3537,65 @@ extension MeetingWatcher {
             m.start = startTime(in: text, date: m.date)
         }
         m.docs += attachments(in: html, base: base, skipping: Set(m.docs.map(\.url)))
+        // Belvedere lists only the agenda on the page; the staff reports are
+        // links inside the agenda PDF.
+        for agenda in m.docs where agenda.name == "Agenda" {
+            guard let url = URL(string: agenda.url),
+                  var (data, response) = try? await URLSession.shared.data(for: URLRequest(url: url, timeoutInterval: 120)) else { continue }
+            if let file = googleViewerTarget(response.url), let (pdf, _) = try? await URLSession.shared.data(for: URLRequest(url: file, timeoutInterval: 120)) {
+                data = pdf
+            }
+            m.docs += linkedDocuments(inPDF: data, skipping: Set(m.docs.map(\.url)))
+        }
         return m
+    }
+
+    /// The documents an agenda PDF links to, in order, each under the item
+    /// number that starts its line ("4.A.", "3."); a link on an unnumbered
+    /// line ("• Correspondence") stays with the item above it.
+    static func linkedDocuments(inPDF data: Data, skipping known: Set<String>) -> [AgendaDoc] {
+        guard let pdf = PDFDocument(data: data), let numberRx = try? NSRegularExpression(pattern: #"^\s*(\d{1,2}(?:\.[A-Za-z0-9]{1,2})?)[.)]?\s"#) else { return [] }
+        var docs: [AgendaDoc] = []
+        var seen = known
+        var current: String?
+        for index in 0..<pdf.pageCount {
+            guard let page = pdf.page(at: index) else { continue }
+            for note in page.annotations {
+                guard let url = (note.action as? PDFActionURL)?.url ?? note.url,
+                      url.path.lowercased().hasSuffix(".pdf") || acrobatShare(url),
+                      !seen.contains(url.absoluteString) else { continue }
+                seen.insert(url.absoluteString)
+                let line = page.selectionForLine(at: CGPoint(x: note.bounds.midX, y: note.bounds.midY))?.string ?? ""
+                let range = NSRange(line.startIndex..., in: line)
+                if let hit = numberRx.firstMatch(in: line, range: range), let r = Range(hit.range(at: 1), in: line) {
+                    current = String(line[r])
+                }
+                docs.append(AgendaDoc(name: "Attachment", url: url.absoluteString, item: current))
+            }
+        }
+        return docs
+    }
+
+    /// The file behind a Google Docs viewer page, where Granicus sends agendas
+    /// that were uploaded as PDFs.
+    static func googleViewerTarget(_ url: URL?) -> URL? {
+        guard let url, url.host == "docs.google.com", url.path.hasPrefix("/gview"),
+              let inner = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "url" })?.value else { return nil }
+        return URL(string: inner)
+    }
+
+    /// An Adobe Acrobat share link: a viewer page, not the file.
+    static func acrobatShare(_ url: URL) -> Bool {
+        url.host?.lowercased() == "acrobat.adobe.com" && url.path.hasPrefix("/id/urn:")
+    }
+
+    /// The signed file address in an Acrobat share page. It expires, so it's
+    /// looked up at download time and the share link stays the document's id.
+    static func acrobatDownloadURL(_ share: String) async -> URL? {
+        guard let html = await fetchText(share, timeout: 60),
+              let r = html.range(of: #""download_url":"[^"]+""#, options: .regularExpression) else { return nil }
+        let quoted = String(html[r].dropFirst(#""download_url":"#.count))
+        return (try? JSONSerialization.jsonObject(with: Data(quoted.utf8), options: .fragmentsAllowed) as? String).flatMap { URL(string: $0) }
     }
 
     /// Every document linked from an agenda page, in agenda order, each
@@ -3614,11 +3694,18 @@ extension MeetingWatcher {
     /// "Packet - …". `added` marks a document found after the agenda was
     /// first saved. Returns the saved file's name.
     static func downloadDocument(_ doc: AgendaDoc, into folder: URL, added: String?) async -> String? {
-        guard let url = URL(string: doc.url) else { return nil }
+        guard var url = URL(string: doc.url) else { return nil }
+        if acrobatShare(url) {
+            guard let file = await acrobatDownloadURL(doc.url) else { return nil }
+            url = file
+        }
         var request = URLRequest(url: url, timeoutInterval: 600)
         request.setValue(downloaderUserAgent, forHTTPHeaderField: "User-Agent")
         guard let (temp, response) = try? await URLSession.shared.download(for: request),
               let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+        if let file = googleViewerTarget(http.url) {
+            return await downloadDocument(AgendaDoc(name: doc.name, url: file.absoluteString, item: doc.item), into: folder, added: added)
+        }
         let mime = (http.mimeType ?? "").lowercased()
         let served = (response.suggestedFilename ?? "").removingPercentEncoding ?? ""
         let ext = mime.contains("pdf") ? "pdf" : mime.contains("html") ? "html"
